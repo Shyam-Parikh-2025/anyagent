@@ -4,8 +4,11 @@ import inspect
 import urllib.request
 import urllib.error
 import threading
+import asyncio
 import time
 from typing import get_type_hints, Callable
+
+from .compressor import CompressionPolicy
 
 
 class Conversation:
@@ -270,13 +273,17 @@ class ToolRegistry:
                 try:
                     args = json.loads(args)
                 except json.JSONDecodeError:
-                    pass
+                    # Auto-wrap single primitive string inputs into standard key payload
+                    sig = inspect.signature(self.functions_maps[name])
+                    params = list(sig.parameters.keys())
+                    if len(params) == 1:
+                        args = {params[0]: args}
 
             if not isinstance(args, dict):
                 return f"Error: Arguments for tool '{name}' must be passed as a dictionary."
 
             res = self.functions_maps[name](**args)
-            return _stringify_tool_output(res)
+            return self._stringify_tool_output(res)
         except Exception as e:
             error_type = e.__class__.__name__
             return f"Tool Execution Failure ({error_type}): {str(e)}. Please adjust your input arguments."
@@ -297,6 +304,16 @@ class ToolRegistry:
         elif provider == "gemini":
             return [{"functionDeclarations": schema_list}]
 
+    @staticmethod
+    def _stringify_tool_output(out) -> str:
+        """Serializes tool return values into valid JSON strings for model consumption."""
+        if isinstance(out, str):
+            return out
+        try:
+            return json.dumps(out)
+        except TypeError:
+            return str(out)
+
 class Agent:
     """ Agent Class:
     This is the core agent class that needs to have several key features:
@@ -314,9 +331,9 @@ class Agent:
         "ollama": "llama3.1:8b"
     }
 
-    def __init__(self, provider: str, model: str = None, base_url: str = None, 
-                 api_key: str = None, system_instruction: str = "", max_tool_iterations: int = 6,
-                 max_tokens: int = None):
+    def __init__(self, provider: str, model: str = None, base_url: str = None,
+                 api_key: str = None, is_local: bool = False, system_instruction: str = "", max_tool_iterations: int = 6,
+                 max_tokens: int = None, compression_policy: CompressionPolicy = None):
         self.conversation = Conversation(system_instruction=system_instruction)
         self.tool_registry = ToolRegistry()
         self.change_api(provider=provider, model=model, base_url=base_url, api_key=api_key)
@@ -324,9 +341,28 @@ class Agent:
         self.max_tokens = max_tokens
         self.thinking_stage = "initial state"
 
-    def _update_stage(self, stage: str, detail: str = "") -> None:
+        self.is_local = is_local
+
+        # Defaults to a disabled policy (compress() is a no-op passthrough) so any existing
+        # Agent(...) call that doesn't pass this keeps behaving exactly like it did before -
+        # see CompressionPolicy in compressor.py for why this is a policy object rather than
+        # the agent owning/constructing a compressor instance.
+        self.compression_policy = compression_policy or CompressionPolicy()
+
+    def tool(self, python_function: Callable, schema: dict = None):
+        """Decorator to register a Python function as a tool with optional schema."""
+        if python_function is None:
+            def decorator(func):
+                self.add_tool(func, schema)
+                return func
+            return decorator
+        self.add_tool(python_function, schema)
+        return python_function
+    
+    def _update_stage(self, stage: str, detail: str = "", thinking_visible: bool = True) -> None:
         """Internal helper to safely mutate system tracking state and print visible console pipelines."""
         self.thinking_stage = stage
+        if not thinking_visible: return
         if detail:
             print(f"[{self.provider.upper()}] ➔ {stage}: {detail}", end="\n", flush=True)
         else:
@@ -399,11 +435,17 @@ class Agent:
         return thread
             
 
-    def chat(self, user_input: str, custom_format_func: Callable[[list], list] = None, max_tokens: int = None) -> str:
+    def chat(self, user_input: str, custom_format_func: Callable[[list], list] = None, max_tokens: int = None,
+             thinking_visible: bool = True, spinner: bool = True) -> str:
         self.conversation.add_user_msg(user_input)
-        max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        
+        return self.generate(custom_format_func, max_tokens=max_tokens, thinking_visible=thinking_visible)
 
-        self._update_stage("initial state")
+    def generate(self, custom_format_func: Callable[[list], list] = None, max_tokens: int = None, 
+                 thinking_visible: bool = True, spinner: bool = True) -> str:
+        """Generate response based on the current conversation and tools."""
+        max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        self._update_stage("initial state", thinking_visible=thinking_visible)
         
         iterations = 0 
         while True:
@@ -416,201 +458,349 @@ class Agent:
             headers = {"Content-Type": "application/json"}
 
             # --- 1. COMPILE THE TARGET PAYLOAD ---
-            if self.provider == "gemini":
-                if self.api_key: headers["x-goog-api-key"] = self.api_key
-                payload = {"contents": history}
-                if tools: payload["tools"] = tools
-                if self.conversation.system_instruction:
-                    payload["systemInstruction"] = {"parts": [{"text": self.conversation.system_instruction}]}
-                if max_tokens is not None:
-                    payload["generationConfig"] = {"maxOutputTokens": max_tokens}
-            
-            elif self.provider == "anthropic":
-                if max_tokens is None: max_tokens = 4096
-                headers.update({"x-api-key": self.api_key, "anthropic-version": "2023-06-01"})
-                payload = {"model": self.model, "messages": history, "max_tokens": max_tokens}
-                if tools: payload["tools"] = tools
-                if self.conversation.system_instruction: payload["system"] = self.conversation.system_instruction
+            payload = self.gen_payload(history, tools, headers, max_tokens)
 
-            elif self.provider in ["openai", "custom"]:
-                if self.api_key: headers["Authorization"] = f"Bearer {self.api_key}"
-                payload = {"model": self.model, "messages": history}
-                if tools: payload["tools"] = tools
-                if max_tokens is not None:
-                    payload["max_completion_tokens"] = max_tokens
-                    payload["max_tokens"] = max_tokens
-
-            elif self.provider == "ollama":
-                payload = {"model": self.model, "messages": history, "stream": False}
-                if tools: payload["tools"] = tools
-                if max_tokens is not None: payload["options"] = {"num_predict": max_tokens}
-            else:
-                raise ValueError(f"Unsupported provider: {self.provider}. Please review how to configure custom providers.")
-
-            self._update_stage("Request sent to AI", f"Payload Size: {len(history)} turns")
-            
-            errors, results = [], []
-            
+            # --- 2. SEND THE REQUEST ---
+            self._update_stage("Request sent to AI", f"Payload Size: {len(history)} turns", thinking_visible=thinking_visible)
+            errors, results = [], []            
             thread = self._execute_with_thread(self._send_request, errors, results, payload, headers)
-            
-            # Keep the main thread alive to animate a spinner while waiting for network bytes
-            spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-            spinner_idx = 0
-            time.sleep(0.08)
-
-            while thread.is_alive():
-                print(f"\r[{self.provider.upper()}] ➔ Thinking {spinner_frames[spinner_idx]} ", end="", flush=True)
-                spinner_idx = (spinner_idx + 1) % len(spinner_frames)
-                time.sleep(0.08)
-            
-            # Clear the spinner trace line cleanly from the console terminal line
-            print("\r" + " " * 50 + "\r", end="", flush=True)
+            self.spinner(spinner, thinking_visible, thread)
 
             # Check if the background thread threw a network exception
-            if errors:
-                raise errors[0]
-
+            if errors: raise errors[0]
             # Unpack the completed parsed json data dictionary
             res = results[0]
 
             # --- 3. PROCESS COMPLETED RESPONSE OBJECTS ---
-            if self.provider == "gemini":
-                if 'candidates' not in res or not res['candidates']:
-                    error_msg = res.get('error', {}).get('message', 'Unknown Gemini API Error')
-                    raise RuntimeError(f"Gemini API empty response or error: {error_msg}")
+            output = self.process_response(res, thinking_visible=thinking_visible)
+            if output is not None: return output
+            continue # continue to the next iteration - left in case of changes later
 
-                parts = res['candidates'][0]['content']['parts']
-                function_calls = [p['functionCall'] for p in parts if 'functionCall' in p]
-                text_parts = [p['text'] for p in parts if 'text' in p]
+    # Helper methods for generating payloads
+    def gen_payload(self, history, tools, headers, max_tokens: int):
+        if self.provider == "gemini":
+            payload = self.gen_payload_gemini(history, tools, headers, max_tokens)
+        
+        elif self.provider == "anthropic":
+            payload = self.gen_payload_anthropic(history, tools, headers, max_tokens)
 
-                if function_calls:
-                    self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in function_calls]))
-                    tool_calls = [{"id": function_call.get("id", ""),
-                                   "function": {"name": function_call['name'], "arguments": function_call.get('args', {})}}
-                                  for function_call in function_calls]
-                    self.conversation.add_model_msg(
-                        text="".join(text_parts) or None,
-                        tool_calls=tool_calls,
-                        native={"role": "model", "parts": parts},
-                        native_provider="gemini"
-                    )
-                    for function_call in function_calls:
-                        name, args = function_call['name'], function_call.get('args', {})
-                        call_id = function_call.get("id", "")
-                        
-                        self._update_stage("Running Tool Local Process", f"Invoking function '{name}'")
-                        out_str = self.tool_registry.execute(name, args)
-                        
-                        function_response = {"name": name, "response": {"result": out_str}}
-                        if call_id: function_response["id"] = call_id
-                        self.conversation.history.append({
-                            "role": "tool", "name": name, "content": out_str, "tool_call_id": call_id,
-                            "_native": {"role": "user", "parts": [{"functionResponse": function_response}]},
-                            "_native_provider": "gemini"
-                        })
-                    self._update_stage("Tool results sent to AI")
-                    continue
+        elif self.provider in ["openai", "custom"]:
+            payload = self.gen_payload_openai_custom(history, tools, headers, max_tokens)
+
+        elif self.provider == "ollama":
+            payload = self.gen_payload_ollama(history, tools, headers, max_tokens)
+
+        else:
+            raise ValueError(f"Unsupported provider: {self.provider}. Please review how to configure custom providers.")
+        return payload
+
+    def gen_payload_gemini(self, history, tools, headers, max_tokens: int):
+        if self.api_key: headers["x-goog-api-key"] = self.api_key
+        payload = {"contents": history}
+        if tools: payload["tools"] = tools
+        if self.conversation.system_instruction:
+            payload["systemInstruction"] = {"parts": [{"text": self.conversation.system_instruction}]}
+        if max_tokens is not None:
+            payload["generationConfig"] = {"maxOutputTokens": max_tokens}
+        return payload
+    
+    def gen_payload_anthropic(self, history, tools, headers, max_tokens: int):
+        if max_tokens is None: max_tokens = 4096
+        headers.update({"x-api-key": self.api_key, "anthropic-version": "2023-06-01"})
+        payload = {"model": self.model, "messages": history, "max_tokens": max_tokens}
+        if tools: payload["tools"] = tools
+        if self.conversation.system_instruction: payload["system"] = self.conversation.system_instruction
+        return payload
+
+    def gen_payload_openai_custom(self, history, tools, headers, max_tokens: int):
+        if self.api_key: 
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        payload = {"model": self.model, "messages": history}
+        if tools: 
+            payload["tools"] = tools
+        if max_tokens is not None:
+            if self.model.startswith(("o1", "o3", "o4", "gpt-5")):
+                payload["max_completion_tokens"] = max_tokens
+            else:
+                payload["max_tokens"] = max_tokens
+        return payload
+    
+    def gen_payload_ollama(self, history, tools, headers, max_tokens: int):
+        payload = {"model": self.model, "messages": history, "stream": False}
+        if tools: payload["tools"] = tools
+        if max_tokens is not None: payload["options"] = {"num_predict": max_tokens}
+        return payload
+    
+    # Helper method for processing completed responses
+    def process_response(self, res, thinking_visible=False):
+        if self.provider == "gemini":
+            output = self.process_gemini_response(res, thinking_visible=thinking_visible)
+            if output is not None: return output
+            return None
+        
+        elif self.provider == "anthropic":
+            output = self.process_anthropic_response(res, thinking_visible=thinking_visible)
+            if output is not None: return output
+            return None
+
+        elif self.provider in ["openai", "custom"]:
+            output = self.process_openai_custom_response(res, thinking_visible=thinking_visible)
+            if output is not None: return output
+            return None
+
+        elif self.provider == "ollama":
+            output = self.process_ollama_response(res, thinking_visible=thinking_visible)
+            if output is not None: return output
+            return None
+        else:
+            raise ValueError(f"Unsupported provider: {self.provider}. Please review how to configure custom providers.")
+
+    def process_gemini_response(self, res, thinking_visible=False):
+        if 'candidates' not in res or not res['candidates']:
+            error_msg = res.get('error', {}).get('message', 'Unknown Gemini API Error')
+            raise RuntimeError(f"Gemini API empty response or error: {error_msg}")
+
+        parts = res['candidates'][0]['content']['parts']
+        function_calls = [p['functionCall'] for p in parts if 'functionCall' in p]
+        text_parts = [p['text'] for p in parts if 'text' in p]
+
+        if function_calls:
+            self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in function_calls]), thinking_visible=thinking_visible)
+            tool_calls = [{"id": function_call.get("id", ""),
+                            "function": {"name": function_call['name'], "arguments": function_call.get('args', {})}}
+                            for function_call in function_calls]
+            self.conversation.add_model_msg(
+                text="".join(text_parts) or None,
+                tool_calls=tool_calls,
+                native={"role": "model", "parts": parts},
+                native_provider="gemini"
+            )
+            for function_call in function_calls:
+                name, args = function_call['name'], function_call.get('args', {})
+                call_id = function_call.get("id", "")
                 
-                text = "".join(text_parts)
-                self.conversation.add_model_msg(text=text)
-                self._update_stage("Success")
-                return text
+                self._update_stage("Running Tool Local Process", f"Invoking function '{name}'", thinking_visible=thinking_visible)
+                out_str = self.tool_registry.execute(name, args)
+                out_str = self.compression_policy.compress(out_str)
+
+                function_response = {"name": name, "response": {"result": out_str}}
+                if call_id: function_response["id"] = call_id
+                self.conversation.history.append({
+                    "role": "tool", "name": name, "content": out_str, "tool_call_id": call_id,
+                    "_native": {"role": "user", "parts": [{"functionResponse": function_response}]},
+                    "_native_provider": "gemini"
+                })
+            self._update_stage("Tool results sent to AI", thinking_visible=thinking_visible)
+            return None
+        
+        text = "".join(text_parts)
+        self.conversation.add_model_msg(text=text)
+        self._update_stage("Success", thinking_visible=thinking_visible)
+        return text
+
+    def process_anthropic_response(self, res, thinking_visible=False):
+        t_calls, final_text = [], ""
+        for block in res.get("content", []):
+            if block["type"] == "text": final_text += block["text"]
+            elif block["type"] == "tool_use":
+                t_calls.append({"id": block["id"], "function": {"name": block["name"], "arguments": block["input"]}})
+        
+        if t_calls:
+            self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in t_calls]), thinking_visible=thinking_visible)
+            self.conversation.add_model_msg(
+                text=final_text if final_text else None, tool_calls=t_calls,
+                native={"role": "assistant", "content": res.get("content", [])}, native_provider="anthropic"
+            )
+            tool_result_blocks = []
+            for tc in t_calls:
+                self._update_stage("Running Tool Local Process", f"Invoking function '{tc['function']['name']}'", thinking_visible=thinking_visible)
+                out_str = self.tool_registry.execute(tc["function"]["name"], tc["function"]["arguments"])
+                out_str = self.compression_policy.compress(out_str)
+                tool_result_blocks.append({"type": "tool_result", "tool_use_id": tc["id"], "content": out_str})
             
-            elif self.provider == "anthropic":
-                t_calls, final_text = [], ""
-                for block in res.get("content", []):
-                    if block["type"] == "text": final_text += block["text"]
-                    elif block["type"] == "tool_use":
-                        t_calls.append({"id": block["id"], "function": {"name": block["name"], "arguments": block["input"]}})
-                
-                if t_calls:
-                    self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in t_calls]))
-                    self.conversation.add_model_msg(
-                        text=final_text if final_text else None, tool_calls=t_calls,
-                        native={"role": "assistant", "content": res.get("content", [])}, native_provider="anthropic"
-                    )
-                    tool_result_blocks = []
-                    for tc in t_calls:
-                        self._update_stage("Running Tool Local Process", f"Invoking function '{tc['function']['name']}'")
-                        out_str = self.tool_registry.execute(tc["function"]["name"], tc["function"]["arguments"])
-                        tool_result_blocks.append({"type": "tool_result", "tool_use_id": tc["id"], "content": out_str})
-                    
-                    native_user_msg = {"role": "user", "content": tool_result_blocks}
-                    for tc, block in zip(t_calls, tool_result_blocks):
-                        self.conversation.history.append({
-                            "role": "tool", "name": tc["function"]["name"], "content": block["content"], "tool_call_id": tc["id"],
-                            "_native": native_user_msg, "_native_provider": "anthropic"
-                        })
-                    self._update_stage("Tool results sent to AI")
-                    continue
-                
-                self.conversation.add_model_msg(text=final_text)
-                self._update_stage("Success")
-                return final_text
+            native_user_msg = {"role": "user", "content": tool_result_blocks}
+            for tc, block in zip(t_calls, tool_result_blocks):
+                self.conversation.history.append({
+                    "role": "tool", "name": tc["function"]["name"], "content": block["content"], "tool_call_id": tc["id"],
+                    "_native": native_user_msg, "_native_provider": "anthropic"
+                })
+            self._update_stage("Tool results sent to AI", thinking_visible=thinking_visible)
+            return None
+        
+        self.conversation.add_model_msg(text=final_text)
+        self._update_stage("Success", thinking_visible=thinking_visible)
+        return final_text
 
-            elif self.provider in ["openai", "custom"]:
-                msg = res['choices'][0]['message']
-                if msg.get("tool_calls"):
-                    self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in msg["tool_calls"]]))
-                    self.conversation.add_model_msg(text=msg.get("content"), tool_calls=msg["tool_calls"])
-                    for tool_call in msg["tool_calls"]:
-                        name = tool_call["function"]["name"]
-                        args = json.loads(tool_call["function"]["arguments"]) if isinstance(tool_call["function"]["arguments"], str) else tool_call["function"]["arguments"]
-                        
-                        self._update_stage("Running Tool Local Process", f"Invoking function '{name}'")
-                        out_str = self.tool_registry.execute(name, args)
-                        self.conversation.add_tool_response(name, out_str, tool_call["id"]) 
-                    self._update_stage("Tool results sent to AI")
-                    continue
+    def process_openai_custom_response(self, res, thinking_visible=False):
+        msg = res['choices'][0]['message']
+        if msg.get("tool_calls"):
+            self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in msg["tool_calls"]]), thinking_visible=thinking_visible)
+            self.conversation.add_model_msg(text=msg.get("content"), tool_calls=msg["tool_calls"])
+            for tool_call in msg["tool_calls"]:
+                name = tool_call["function"]["name"]
+                args = json.loads(tool_call["function"]["arguments"]) if isinstance(tool_call["function"]["arguments"], str) else tool_call["function"]["arguments"]
                 
-                text = msg.get("content", "")
-                self.conversation.add_model_msg(text=text)
-                self._update_stage("Success")
-                return text
+                self._update_stage("Running Tool Local Process", f"Invoking function '{name}'", thinking_visible=thinking_visible)
+                out_str = self.tool_registry.execute(name, args)
+                out_str = self.compression_policy.compress(out_str)
+                self.conversation.add_tool_response(name, out_str, tool_call["id"])
+            self._update_stage("Tool results sent to AI", thinking_visible=thinking_visible)
+            return None
+        
+        text = msg.get("content", "")
+        self.conversation.add_model_msg(text=text)
+        self._update_stage("Success", thinking_visible=thinking_visible)
+        return text    
+
+    def process_ollama_response(self, res, thinking_visible=False):
+        msg = res.get("message", {})
+        if msg.get("tool_calls"):
+            self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in msg["tool_calls"]]), thinking_visible=thinking_visible)
             
-            elif self.provider == "ollama":
-                msg = res.get("message", {})
-                if msg.get("tool_calls"):
-                    self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in msg["tool_calls"]]))
-                    
-                    sanitized_calls = []
-                    for tc in msg["tool_calls"]:
-                        func = tc.get("function") or {}
-                        args = func.get("arguments") or {}
-                        if isinstance(args, str) and args.strip():
-                            try: args = json.loads(args)
-                            except json.JSONDecodeError: args = {}
-                        elif isinstance(args, str): args = {}
-                        sanitized_calls.append({
-                            "id": tc.get("id"),
-                            "function": {"name": func.get("name"), "arguments": args}
-                        })
+            sanitized_calls = []
+            for tc in msg["tool_calls"]:
+                func = tc.get("function") or {}
+                args = func.get("arguments") or {}
+                if isinstance(args, str) and args.strip():
+                    try: args = json.loads(args)
+                    except json.JSONDecodeError: args = {}
+                elif isinstance(args, str): args = {}
+                sanitized_calls.append({
+                    "id": tc.get("id"),
+                    "function": {"name": func.get("name"), "arguments": args}
+                })
 
-                    self.conversation.add_model_msg(text=msg.get("content"), tool_calls=sanitized_calls)
-                    for tc in sanitized_calls:
-                        name, args = tc["function"]["name"], tc["function"]["arguments"]
-                        self._update_stage("Running Tool Local Process", f"Invoking function '{name}'")
-                        out_str = self.tool_registry.execute(name, args)
-                        self.conversation.add_tool_response(name, out_str, tc.get("id"))
-                    self._update_stage("Tool results sent to AI")
-                    continue
-                
-                text = msg.get("content", "")
-                self.conversation.add_model_msg(text=text)
-                self._update_stage("Success")
-                return text
+            self.conversation.add_model_msg(text=msg.get("content"), tool_calls=sanitized_calls)
+            for tc in sanitized_calls:
+                name, args = tc["function"]["name"], tc["function"]["arguments"]
+                self._update_stage("Running Tool Local Process", f"Invoking function '{name}'", thinking_visible=thinking_visible)
+                out_str = self.tool_registry.execute(name, args)
+                out_str = self.compression_policy.compress(out_str)
+                self.conversation.add_tool_response(name, out_str, tc.get("id"))
+            self._update_stage("Tool results sent to AI", thinking_visible=thinking_visible)
+            return None
+        
+        text = msg.get("content", "")
+        self.conversation.add_model_msg(text=text)
+        self._update_stage("Success", thinking_visible=thinking_visible)
+        return text
 
+    # Other helper methods
     def change_default_max_tokens(self, max_tokens: int):
         self.max_tokens = max_tokens
 
-def _stringify_tool_output(out) -> str:
-    """Serializes tool return values into valid JSON strings for model consumption."""
-    if isinstance(out, str):
-        return out
-    try:
-        return json.dumps(out)
-    except TypeError:
-        return str(out)
+    def set_system(self, instruction: str) -> "Agent":
+        """Chainable method to update system instructions."""
+        self.conversation.change_system_instruction(instruction)
+        return self
+
+    def set_max_tokens(self, tokens: int) -> "Agent":
+        """Chainable method to update output token limits."""
+        self.max_tokens = tokens
+        return self
+
+    def set_compression_policy(self, policy: CompressionPolicy) -> "Agent":
+        """Chainable method to change how this agent compresses tool output before it hits
+        history. Pass CompressionPolicy(enabled=False) to switch it back off."""
+        self.compression_policy = policy
+        return self
+
+    def set_iterations(self, max_iterations: int) -> "Agent":
+        """Chainable method to set tool execution limits."""
+        self.set_max_tool_iterations(max_iterations)
+        return self
+
+    def with_tool(self, func: Callable, schema: dict = None) -> "Agent":
+        """Chainable method to register a tool."""
+        self.add_tool(func, schema)
+        return self
+
+    def spinner(self, spinner, thinking_visible, thread):
+        # Keep the main thread alive to animate a spinner while waiting for network bytes
+            spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+            spinner_idx = 0
+
+            while thread.is_alive():
+                if spinner:
+                    print(f"\r[{self.provider.upper()}] ➔ Thinking {spinner_frames[spinner_idx]} ", end="", flush=True)
+                    spinner_idx = (spinner_idx + 1) % len(spinner_frames)
+                    time.sleep(0.08)
+                else:
+                    thread.join(timeout=0.1)  # Wait briefly to avoid busy-waiting
+                    #self._update_stage(f"\r[{self.provider.upper()}] ➔ Thinking", thinking_visible=thinking_visible)
+            
+            # Clear the spinner trace line cleanly from the console terminal line
+            print("\r" + " " * 50 + "\r", end="", flush=True)
+
+    async def _animate_spinner(self, thinking_visible: bool):
+        """Asynchronous terminal spinner running on the asyncio event loop."""
+        spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        spinner_idx = 0
+        try:
+            while True:
+                if thinking_visible:
+                    print(f"\r[{self.provider.upper()}] ➔ Thinking {spinner_frames[spinner_idx]} ", end="", flush=True)
+                    spinner_idx = (spinner_idx + 1) % len(spinner_frames)
+                await asyncio.sleep(0.08)  # Relinquishes control cleanly to event loop
+        except asyncio.CancelledError:
+            # Clear spinner line cleanly when the network task completes
+            print("\r" + " " * 50 + "\r", end="", flush=True)
+
+    async def chat_async(self, user_input: str, custom_format_func: Callable[[list], list] = None, max_tokens: int = None,
+                 thinking_visible: bool = True, spinner: bool = True) -> str:
+            self.conversation.add_user_msg(user_input)
+            
+            return await self.generate_async(custom_format_func, max_tokens=max_tokens, thinking_visible=thinking_visible)
+    
+    async def generate_async(
+        self, custom_format_func: Callable[[list], list] = None, 
+        max_tokens: int = None, thinking_visible: bool = True, 
+        spinner: bool = True) -> str:
+        max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        self._update_stage("initial state", thinking_visible=thinking_visible)
+        
+        iterations = 0 
+        while True:
+            iterations += 1
+            if iterations > self.max_tool_iterations:
+                raise RuntimeError(f"Exceeded max_tool_iterations ({self.max_tool_iterations})")
+
+            history = self.conversation.export_for(self.provider, special_format=custom_format_func)
+            tools = self.tool_registry.export_for(self.provider, special_format=custom_format_func)
+            headers = {"Content-Type": "application/json"}
+
+            # --- 1. COMPILE THE TARGET PAYLOAD ---
+            payload = self.gen_payload(history, tools, headers, max_tokens)
+
+            # --- 2. SEND THE REQUEST ---
+            self._update_stage("Request sent to AI", f"Payload Size: {len(history)} turns", thinking_visible=thinking_visible)
+
+            spinner_async_task = None
+            if spinner:
+                spinner_async_task = asyncio.create_task(self._animate_spinner(thinking_visible))
+
+            response = None
+            try:
+                # Offloads urllib request to thread pool; returns result directly or raises exception
+                response = await asyncio.to_thread(self._send_request, payload, headers)
+            except Exception as err:
+                # Preserves explicit error logging before bubbling up
+                self._update_stage("Network/API Exception", str(err), thinking_visible=thinking_visible)
+                raise err
+            finally:
+                if spinner_async_task:
+                    spinner_async_task.cancel()
+                    try:
+                        await spinner_async_task
+                    except asyncio.CancelledError:
+                        pass
+
+            # --- 3. PROCESS COMPLETED RESPONSE OBJECTS ---
+            output = self.process_response(response, thinking_visible=thinking_visible)
+            if output is not None: 
+                return output
+            continue # continue to the next iteration - left in case of changes later
+
 
 def test():
     import dotenv
@@ -621,6 +811,13 @@ def test():
         if user_input.lower() == "quit":
             break
         response = agent.chat(user_input)
+        print(f"Agent: {response}")
+    
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() == "quit":
+            break
+        response = agent.chat(user_input, thinking_visible=False, spinner=False)
         print(f"Agent: {response}")
     
     agent = Agent('ollama', 'llama3')
