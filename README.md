@@ -109,6 +109,31 @@ stub = ContextCompressor.code_to_stub(source_code)
 trimmed = ContextCompressor.compress_batch(outputs, total_budget=4000)
 ```
 
+## Tracking token usage
+
+`Agent` can estimate how many tokens the current conversation would cost on
+the next request, and how many are left before a budget you set is hit. This
+uses the same no-external-tokenizer heuristic as `CompressionPolicy`
+(`ContextCompressor.token_estimate`), so treat it as an estimate rather than
+an exact provider count:
+
+```python
+agent = Agent(provider="anthropic", model="claude-3-5-sonnet-20241022",
+               max_context_tokens=100_000)
+
+agent.chat("Summarize this document...")
+
+agent.tokens_used()   # -> estimated tokens system instruction + history + tools would cost
+agent.tokens_left()   # -> max_context_tokens - tokens_used(), floored at 0
+```
+
+`max_context_tokens` is a separate concept from `max_tokens`: `max_tokens` is
+the per-request *output* cap sent to the provider (Anthropic's `max_tokens`,
+Gemini's `maxOutputTokens`, ...), while `max_context_tokens` is a budget you
+track your whole conversation against. If you don't set `max_context_tokens`
+(default `None`), `tokens_left()` returns `None` since there's no budget to
+count down from. Change it later with `agent.set_max_context_tokens(200_000)`.
+
 ## Rank-based routing
 
 `ModelRouter` maps an organizational "rank" (intern up through C-suite) to a

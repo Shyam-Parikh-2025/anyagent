@@ -1,14 +1,25 @@
 from typing import Dict, Any, Optional, Tuple
 from .hardware import HardwareProfiler, ResourceQuota
 from .compressor import CompressionPolicy
+from .benchmark import BenchmarkResult
+from .selector import LocalModelSelector, ModelCatalog, SelectionResult
 
 
 class RoleRank:
     C_SUITE = "C_SUITE"
+    GENERAL_MANAGER = "GENERAL_MANAGER"
     MANAGER = "MANAGER"
     SENIOR = "SENIOR"
     JUNIOR = "JUNIOR"
     INTERN = "INTERN"
+    VOLUNTEER = "VOLUNTEER"
+
+    # Rough seniority order, highest authority first - company.py uses this to
+    # find a sensible default entry point (top of the chain) and to decide
+    # which direction "up" is when escalating. Not a capability ranking - a
+    # VOLUNTEER isn't necessarily weaker than an INTERN, just lowest-priority
+    # for delegation and budget purposes (see company.py's budget docs).
+    ORDER = [C_SUITE, GENERAL_MANAGER, MANAGER, SENIOR, JUNIOR, INTERN, VOLUNTEER]
 
 
 class ModelRouter:
@@ -68,6 +79,42 @@ class ModelRouter:
             return model_map.get("frontier_default", "claude-3-5-sonnet-20241022")
 
         return model_map.get("fast_default", "gemini-2.5-flash")
+
+    @classmethod
+    def allocate_local_auto(
+        cls,
+        benchmark: BenchmarkResult,
+        catalog: Optional[ModelCatalog] = None,
+        requested_name: Optional[str] = None,
+        requested_provider: Optional[str] = None,
+        quota: Optional[ResourceQuota] = None,
+        min_gpu_resident_fraction: float = 0.5,
+    ) -> SelectionResult:
+        """'Auto mode' for local models: picks the best-fitting installed local
+        model for this machine using real hardware.benchmark numbers, instead
+        of check_hardware_safety's flat 5GB guess above. Pass requested_name to
+        pin a specific model - if it isn't installed, the result carries
+        needs_install/install_hint instead of silently falling back to
+        something else. Leave requested_name as None to let it pick the best
+        installed candidate outright.
+
+        catalog defaults to a fresh ModelCatalog() (auto-discovers Ollama/LM
+        Studio/HF on every call); pass one in to reuse registrations made via
+        catalog.register(), e.g. for models the caller wants considered even
+        before install.
+
+        See selector.LocalModelSelector for the ranking logic and its current
+        limits (fit-tier heuristic, not a tokens/sec predictor yet).
+        """
+        catalog = catalog or ModelCatalog()
+        return LocalModelSelector.select_best(
+            benchmark=benchmark,
+            catalog=catalog,
+            requested_name=requested_name,
+            requested_provider=requested_provider,
+            quota=quota,
+            min_gpu_resident_fraction=min_gpu_resident_fraction,
+        )
 
     @classmethod
     def allocate_compression_policy(cls, rank: str) -> CompressionPolicy:

@@ -45,7 +45,7 @@ print("PASS 1: anthropic parallel tool calls bundle correctly")
 agent = Agent(provider="anthropic", api_key="k")  # no model given
 assert agent.model == "claude-3-5-sonnet-20241022", agent.model
 agent2 = Agent(provider="gemini", api_key="k")
-assert agent2.model == "gemini-1.5-flash"
+assert agent2.model == "gemini-3.5-flash", agent2.model
 print("PASS 2: default model fallback works per provider")
 
 

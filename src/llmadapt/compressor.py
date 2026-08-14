@@ -44,6 +44,16 @@ class ContextCompressor:
         return max(1, sum(ContextCompressor._chunk_tokens(c) for c in _TOKEN_CHUNK.findall(text)))
 
     @staticmethod
+    def token_estimate(text: str) -> int:
+        """Public entry point for the chunk-based token estimate used throughout this file
+        (_token_len). Everything internal to ContextCompressor/CompressionPolicy/
+        HistoryCompactionPolicy keeps calling _token_len directly since they're already inside
+        the class - this wrapper exists so code outside this module (e.g. Agent.tokens_used())
+        has a stable, non-underscored name to call instead of reaching into a "private"
+        method. Same accuracy caveats apply: no external tokenizer, just a heuristic."""
+        return ContextCompressor._token_len(text)
+
+    @staticmethod
     def _char_offset_for_token_budget(text: str, token_budget: int, from_end: bool = False) -> int:
         """Finds a character offset such that the estimated token count of the kept slice is
         as close to token_budget as possible without going over. Walks the same chunks
@@ -291,6 +301,140 @@ class ContextCompressor:
         return [ContextCompressor.compress_tool_output(o, max_chars=caps[i], dedupe=True, summarizer=summarizer)
                 for i, o in enumerate(outputs)]
 
+    # -----------------------------------------------------------------------------------
+    # Conversation history compaction.
+    #
+    # Everything above compresses ONE thing at the moment it's about to enter history (a tool
+    # result, a source file). Nothing above ever looks at the conversation as a whole - so a
+    # long-running agent's history keeps growing forever, one already-compressed message at a
+    # time. This section is the other half: once in a while, fold OLD history down into
+    # something much smaller, while leaving recent turns untouched.
+    #
+    # The tricky part is that Conversation.history isn't just a list of strings - it's a list
+    # of provider-protocol-shaped dicts (system/user/assistant/tool messages, some carrying
+    # tool_calls, some carrying a matching tool_call_id). Gemini and Anthropic both require a
+    # tool call and its result(s) to travel together as one valid unit - you can't compact away
+    # half of that pairing without producing a history their API will reject. So compaction
+    # here never looks at individual messages; it first groups the flat list into safe atomic
+    # units (_group_into_rounds), then only ever keeps-whole or replaces-whole a unit at a time.
+    # -----------------------------------------------------------------------------------
+
+    @staticmethod
+    def _group_into_rounds(history: list) -> list:
+        """Groups a flat message list into atomic units that are safe to compact independently.
+
+        A user or system message, or a plain assistant text reply, stands alone as a group of
+        one. An assistant/model message that made tool call(s) - detected generically via a
+        truthy 'tool_calls' key, matching how core.py's Conversation stores them - gets grouped
+        together with every 'tool' role message that immediately follows it, up to the next
+        non-tool message. That's deliberate, not an arbitrary batching choice: Gemini
+        (functionResponse) and Anthropic (tool_result) both require a tool call and its
+        result(s) to stay paired by ID as one protocol-valid unit. If compaction split a
+        tool_call from its result - kept one, replaced the other - the resulting history would
+        no longer be valid for that provider's API. So a whole round is the smallest thing
+        compaction ever touches, never a partial slice of one.
+
+        Anything unrecognized is kept as its own single-message group defensively - safer to
+        under-group (worst case: less gets compacted) than to accidentally merge two things
+        that shouldn't be collapsed together."""
+        groups = []
+        i, n = 0, len(history)
+        while i < n:
+            msg = history[i]
+            if msg.get("role") in ("assistant", "model") and msg.get("tool_calls"):
+                group = [msg]
+                i += 1
+                while i < n and history[i].get("role") == "tool":
+                    group.append(history[i])
+                    i += 1
+                groups.append(group)
+            else:
+                groups.append([msg])
+                i += 1
+        return groups
+
+    @staticmethod
+    def _compact_algorithmic(groups: list, result_chars: int) -> list:
+        """The "extremely smart algorithm" path - no model call, purely structural, can't fail.
+
+        A lone-message group (user/system message, or a plain assistant text reply) is kept
+        completely verbatim. That's a deliberate choice, not laziness: those messages ARE the
+        conversation - the actual questions, answers, and decisions - and they're usually a
+        small fraction of the total byte count anyway. A tool-round group (assistant
+        tool_calls + its paired results, see _group_into_rounds) is where the real bulk
+        usually lives - file dumps, command output, log spew - so that's what gets collapsed:
+        the whole round becomes ONE synthetic message naming what was called and a short
+        compress_tool_output'd digest of what each call returned. Reuses compress_tool_output
+        (dedupe + truncation) for each individual result rather than reinventing that logic."""
+        compacted = []
+        for group in groups:
+            if len(group) == 1:
+                compacted.append(group[0])
+                continue
+
+            call_msg, *tool_msgs = group
+            call_descs = []
+            for tc in (call_msg.get("tool_calls") or []):
+                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                name = fn.get("name", "?")
+                args = str(fn.get("arguments", ""))
+                if len(args) > 60:
+                    args = args[:60] + "..."
+                call_descs.append(f"{name}({args})")
+
+            result_descs = []
+            for tool_msg in tool_msgs:
+                name = tool_msg.get("name", "?")
+                digest = ContextCompressor.compress_tool_output(
+                    str(tool_msg.get("content", "")), max_chars=result_chars, dedupe=True)
+                result_descs.append(f"{name} -> {digest}")
+
+            compacted.append({
+                "role": "assistant",
+                "content": f"[compacted tool round] called {', '.join(call_descs) or 'a tool'}; "
+                           f"{'; '.join(result_descs)}"
+            })
+        return compacted
+
+    @staticmethod
+    def _compact_with_summarizer(groups: list, summarizer: Callable[[str, int], str], budget_chars: int,
+                                  algorithmic_fallback_chars: int) -> list:
+        """The "use an agent" path - flattens every message across ALL these groups into one
+        text blob (one "role: content" line each) and asks the summarizer for a single prose
+        digest covering the whole chunk in one call. More expensive per call than the
+        algorithmic path (it's an actual model call), but a real model can understand what
+        mattered across many turns - which decision stuck, which approach got abandoned -
+        instead of mechanically restating each tool round in isolation.
+
+        Note this deliberately does NOT construct or pick a model itself, same reasoning as
+        compress_tool_output's summarizer: this file never imports Agent/core/router, so it
+        can't cause a circular import and can't trigger a hidden local-model load behind
+        LocalModelSingleton's back. summarizer is just any (text, budget) -> str callable -
+        which means it can be the EXACT SAME closure a CompressionPolicy is already using for
+        tool-output summarization, or a different one. Whoever builds it (router.py, by rank)
+        decides local vs API - e.g. a manager-tier agent could point this at a fast API model
+        for good-quality digests, while a junior-tier agent (if it summarizes history at all)
+        points it at whatever local model it's already got loaded, or just skips agent mode
+        entirely and uses "algorithmic" instead. That choice never has to live in this file.
+
+        Falls back to _compact_algorithmic - which can't fail, no model involved - if the
+        summarizer throws, isn't configured, or hands back nothing useful. Same "compaction
+        should never be the thing that breaks a run" principle as compress_tool_output."""
+        lines = [f"{msg.get('role', '?')}: {msg.get('content')}"
+                 for group in groups for msg in group if msg.get("content")]
+        blob = "\n".join(lines)
+        if not blob:
+            return []
+        try:
+            summary = summarizer(blob, budget_chars)
+            if not summary:
+                raise ValueError("summarizer returned empty output")
+            logger.debug("history compaction: agent-summarized %d groups into %d chars", len(groups), len(summary))
+            return [{"role": "assistant", "content": f"[earlier conversation summary] {summary}"}]
+        except Exception as e:
+            logger.warning("history compaction: summarizer failed (%r), falling back to algorithmic", e)
+            return ContextCompressor._compact_algorithmic(groups, algorithmic_fallback_chars)
+
 
 @dataclass
 class CompressionPolicy:
@@ -381,6 +525,122 @@ class CompressionPolicy:
             output, max_chars=self.max_chars, max_tokens=self.max_tokens, summarizer=self.summarizer)
 
 
+@dataclass
+class HistoryCompactionPolicy:
+    """The other half of "installing the compressor on an agent" - CompressionPolicy handles
+    one tool result at a time, this handles the conversation as a whole once it's grown too
+    big. Same philosophy as CompressionPolicy: this is plain config + dispatch, not a place
+    that owns or constructs a model - see CompressionPolicy's docstring for the full circular
+    import / model-thrash reasoning, it applies here identically.
+
+    Three modes, which is the actual "choice given to the user" this was built for:
+
+    mode="off" (default): never touches history. Exactly today's behavior if nothing sets this.
+
+    mode="algorithmic": the "extremely smart algorithm" option - no model call, can't fail,
+    effectively free. Structural, not semantic: it can't know that "the bug from turn 3 got
+    fixed in turn 8" the way a real summary could, but it never mangles a provider's tool-
+    calling protocol either, and it costs nothing to run on every single turn. Good default
+    for worker/local-tier agents for the same reason CompressionPolicy defaults workers to no
+    summarizer - it shouldn't be triggering a second model load just to tidy up its own history.
+
+    mode="agent": the "use an agent" option - one summarizer call condenses the whole old
+    chunk into a real prose digest, better quality (an actual model can tell what mattered),
+    at the cost of an actual model call every time compaction triggers. summarizer is local-
+    or-API purely by which closure gets handed in - this file has no opinion and no import of
+    either. Falls back to "algorithmic" automatically if the summarizer fails or isn't set, so
+    setting mode="agent" is never a way to break a run, only to try to improve it.
+
+    Fields:
+        mode                   "off" | "algorithmic" | "agent". Anything other than "agent" is
+                              treated as algorithmic once compaction actually triggers - so a
+                              typo degrades to the free/safe path rather than silently no-op'ing
+                              or crashing.
+        keep_recent_rounds     How many of the most recent atomic groups (see
+                              ContextCompressor._group_into_rounds) are always left completely
+                              untouched, regardless of mode. Recent turns are the ones most
+                              likely still relevant to what the agent is doing right now.
+        trigger_tokens          Compaction only actually runs once the estimated token size of
+                              everything outside keep_recent_rounds exceeds this (see
+                              ContextCompressor._token_len). Below that, compact() is a no-op -
+                              no point paying the cost (algorithmic work, or a model call) on a
+                              conversation that isn't actually a context-budget problem yet.
+        summarizer              Only used in mode="agent". Same (text, budget) -> str shape as
+                              CompressionPolicy.summarizer - and can literally be the same
+                              closure, reused for both tool-output and history summarization,
+                              if that's what the caller wants.
+        summary_budget_chars     How large the agent-mode summary is allowed to be - passed as
+                              the budget argument to summarizer.
+        algorithmic_result_chars  Per-tool-result budget used when digesting a compacted tool
+                              round (mode="algorithmic", and also mode="agent"'s fallback).
+
+    Usage (illustrative - this is how an agent would use one, not code that runs today):
+
+        # a worker: cheap structural compaction, no model call
+        worker_history_policy = HistoryCompactionPolicy(mode="algorithmic", keep_recent_rounds=8)
+
+        # a manager: real summaries, using whichever agent/model router.py already picked
+        manager_history_policy = HistoryCompactionPolicy(mode="agent", summarizer=some_closure)
+
+        # wherever an Agent is about to send its next request:
+        self.conversation.history = self.history_policy.compact(self.conversation.history)
+    """
+    mode: str = "off"
+    keep_recent_rounds: int = 6
+    trigger_tokens: int = 6000
+    summarizer: Optional[Callable[[str, int], str]] = None
+    summary_budget_chars: int = 1000
+    algorithmic_result_chars: int = 150
+
+    def compact(self, history: list) -> list:
+        """The one method an agent actually calls, once per turn (or however often it wants -
+        this is cheap to call and a no-op below trigger_tokens). Returns a - possibly
+        unchanged - history list; never mutates the list passed in."""
+        if self.mode == "off" or not history:
+            return history
+
+        # A leading system message is almost always the agent's core instructions, not part
+        # of "the conversation" - keep it out of the compaction pool entirely rather than
+        # risk it ever getting folded into a digest.
+        leading_system, body = None, history
+        if history[0].get("role") == "system":
+            leading_system, body = history[0], history[1:]
+        if not body:
+            return history
+
+        total_tokens = ContextCompressor._token_len(
+            "\n".join(str(m.get("content", "")) for m in body))
+        if total_tokens <= self.trigger_tokens:
+            return history  # under budget - nothing to do, don't even bother grouping
+
+        groups = ContextCompressor._group_into_rounds(body)
+        if len(groups) <= self.keep_recent_rounds:
+            return history  # not enough history yet to safely compact anything
+
+        old_groups = groups[:-self.keep_recent_rounds]
+        recent_groups = groups[-self.keep_recent_rounds:]
+
+        if self.mode == "agent":
+            if self.summarizer is None:
+                logger.warning("HistoryCompactionPolicy: mode='agent' but no summarizer set - "
+                                "falling back to algorithmic compaction")
+                compacted = ContextCompressor._compact_algorithmic(old_groups, self.algorithmic_result_chars)
+            else:
+                compacted = ContextCompressor._compact_with_summarizer(
+                    old_groups, self.summarizer, self.summary_budget_chars, self.algorithmic_result_chars)
+        else:
+            compacted = ContextCompressor._compact_algorithmic(old_groups, self.algorithmic_result_chars)
+
+        recent_msgs = [msg for group in recent_groups for msg in group]
+        result = compacted + recent_msgs
+        if leading_system is not None:
+            result = [leading_system] + result
+
+        logger.debug("HistoryCompactionPolicy: %d messages -> %d (%s mode, %d groups compacted)",
+                     len(history), len(result), self.mode, len(old_groups))
+        return result
+
+
 if __name__ == '__main__':
     sample_code = '''class Agent:
     async def chat_async(self, user_input: str, custom_format_func: Callable[[list], list] = None, max_tokens: int = None,
@@ -410,3 +670,40 @@ SUPPORTED_MODELS = [f"model-{i}" for i in range(50)]
     print("no_policy   :", len(no_policy.compress(big_result)), "chars (untouched)")
     print("worker_policy:", len(worker_policy.compress(big_result)), "chars (compressed)")
     print("tiny result :", len(worker_policy.compress("ok")), "chars (below min_chars_to_bother, untouched)")
+
+    print("\n--- HistoryCompactionPolicy demo ---")
+
+    def make_fake_history(n_rounds):
+        """Builds a synthetic Conversation.history-shaped list: a system message, then
+        n_rounds of (user question -> assistant tool call -> tool result), ending on a plain
+        assistant text reply - same dict shape core.py actually produces."""
+        h = [{"role": "system", "content": "You are a build assistant."}]
+        for i in range(n_rounds):
+            h.append({"role": "user", "content": f"Please check on task {i}."})
+            h.append({ "role": "assistant", "content": None, # type: ignore 
+                      "tool_calls": [{"function": {"name": "run_tests", # TODO remove type ignore properly
+                                     "arguments": {"suite": f"suite_{i}"}}}]})
+            h.append({"role": "tool", "name": "run_tests",
+                      "content": f"Running suite_{i}...\n" + "PASS test_case\n" * 30 + "2 failures found."})
+        h.append({"role": "assistant", "content": "All caught up - want me to keep going?"})
+        return h
+
+    history = make_fake_history(10)
+    print(f"synthetic history: {len(history)} messages across {len(ContextCompressor._group_into_rounds(history[1:]))} groups")
+
+    algo_policy = HistoryCompactionPolicy(mode="algorithmic", keep_recent_rounds=3, trigger_tokens=50)
+    compacted = algo_policy.compact(history)
+    print(f"algorithmic mode: {len(history)} -> {len(compacted)} messages")
+    print("  sample compacted round:", repr(compacted[1]["content"][:150]))
+
+    def fake_summarizer(text, budget):
+        return f"(fake model summary of {len(text)} chars of history, budget was {budget})"
+
+    agent_policy = HistoryCompactionPolicy(mode="agent", keep_recent_rounds=3, trigger_tokens=50,
+                                            summarizer=fake_summarizer)
+    compacted_agent = agent_policy.compact(history)
+    print(f"agent mode: {len(history)} -> {len(compacted_agent)} messages")
+    print("  summary message:", repr(compacted_agent[1]["content"]))
+
+    print("under trigger_tokens: no-op ->",
+          HistoryCompactionPolicy(mode="algorithmic", trigger_tokens=999999).compact(history) is history)
