@@ -1,78 +1,98 @@
-# Pushing this overnight run to GitHub
+# Getting this onto GitHub
 
-**Why this file exists.** The plan was for the cloud session to `git push`
-after every phase. It couldn't: the sandbox routes git through a proxy that
-refuses to inject credentials for any repo outside the session's authorized
-set, so `Shyam-Parikh-2025/llmadapt` was rejected with a 403 at the proxy — the
-token you provided never even reached GitHub. Nothing was wrong with the token.
+## The short version
 
-So the run fell back to the other option in the handoff doc: full git history
-kept in the cloud clone, every phase committed there, and every changed file
-synced to this machine after each phase via the device bridge. **The files in
-this folder are already up to date** — this file is only about getting the
-*commit history* onto GitHub.
+Your old `main` is **already** saved as the `v0.2.0` branch on GitHub — you
+created it before this run, and it points at exactly the old tip
+(`d8add87`). So nothing needs protecting and nothing gets overwritten.
 
-Also worth knowing: the GitHub repo was several sessions behind this folder
-when the run started (it had no `company.py`, `budget.py`, `observability.py`,
-`selector.py` or `benchmark.py`). The first commit of the run brings it level.
+The new work sits **on top of** that old commit, not beside it. In git terms
+this is a fast-forward: pushing adds 11 new commits after `d8add87` and leaves
+every old commit exactly where it is. **No force push. No rewritten history.**
 
----
+```
+d8add87  ← old main, and where the v0.2.0 branch stays pointing
+   │
+   ├── dce01c4  Sync Phases 0-3 from the working machine
+   ├── 2c0b2b3  Phase 4: model policy
+   ├── eb36b4b  Phase 5: preset registry
+   ├── b17ae79  Phase 6: delegation
+   ├── 6c18942  Phase 7: log compaction
+   ├── ddab531  Phase 8: text-mode builder
+   ├── fd5cd9a  Phase 8: GUI editor
+   └── ... 4 more  ← new main
+```
 
-## Option 1 — restore the history from the bundle (recommended)
+## Why you have to do it and not the overnight session
 
-`llmadapt-overnight.bundle` sits next to this file. It is a complete git
-repository in one file: 9 commits, the whole run.
+The cloud sandbox routes git through a proxy that refuses to attach credentials
+for any repo outside its authorized list:
+
+```
+remote: access denied by the git proxy: Shyam-Parikh-2025/llmadapt is not in
+this session's authorized repository set
+```
+
+It fails with 403 *before* your token is ever used. Nothing was wrong with the
+token — no credential trick gets around it. Reading (clone) worked; writing
+did not.
+
+## Do this
+
+`llmadapt-overnight.bundle` is a complete copy of the repository in one file —
+all 25 commits and the `v0.3.0` tag.
 
 ```bash
 cd "C:\Users\HP\OneDrive\Coding Projects\Basics Genai"
 git clone llmadapt\llmadapt-overnight.bundle llmadapt-pushed
 cd llmadapt-pushed
 git remote set-url origin https://github.com/Shyam-Parikh-2025/llmadapt.git
+
+# look before you leap - this lists exactly what would be sent
+git fetch origin
+git log --oneline origin/main..main
+
+git push origin main
+git push origin v0.3.0        # the release tag
+```
+
+After that, GitHub shows the new work on `main`, and `v0.2.0` still shows the
+old code. Anyone can compare them at:
+`https://github.com/Shyam-Parikh-2025/llmadapt/compare/v0.2.0...main`
+
+## If you'd rather push from the folder you already work in
+
+Only if that folder is a git repo already. Check with `git status`. If it is:
+
+```bash
+cd "C:\Users\HP\OneDrive\Coding Projects\Basics Genai\llmadapt"
+git add -A
+git commit -m "Phases 4-8: model policy, presets, delegation, compaction, company builder"
 git push origin main
 ```
 
-Check it first if you like — `git log --oneline` in that clone shows one commit
-per phase, each with the reasoning in its message.
+You lose the per-phase commit messages this way — everything becomes one
+commit. `company-roadmap.md` still has the full reasoning, but the bundle route
+above keeps the history properly, so prefer it.
 
-Once you're happy, `llmadapt-pushed` is the canonical copy; you can delete the
-old folder or just keep working in the new one.
+## Two housekeeping notes
 
-## Option 2 — commit this folder as one commit
+**Revoke the token.** GitHub → Settings → Developer settings → Personal access
+tokens. It never worked (the proxy blocked it) and was never written into any
+file here — but it did appear in a chat transcript, so retire it.
 
-If you don't care about the per-phase history and just want the code on GitHub:
+**The commits are authored as you** (`Shyam Parikh
+<shyamsparikh11@gmail.com>`), because that's what you asked for at the start.
+Each one carries a `Co-Authored-By: Claude Opus 5` trailer, which is the
+standard way AI assistance is recorded. GitHub will mark them "Unverified"
+simply because they aren't GPG-signed — that's true of every unsigned commit
+and is unrelated to this run.
 
-```bash
+## Check it before you push
+
+```powershell
 cd "C:\Users\HP\OneDrive\Coding Projects\Basics Genai\llmadapt"
-git init                       # only if this folder isn't a git repo yet
-git remote add origin https://github.com/Shyam-Parikh-2025/llmadapt.git
-git add -A
-git commit -m "Phases 4-8: model policy, presets, delegation, compaction, company builder"
-git push -u origin main
-```
-
-You lose the per-phase commit messages this way, but `company-roadmap.md` has
-the same reasoning in more detail.
-
----
-
-## Revoke the token
-
-The fine-grained PAT you pasted into the chat should be revoked once you've
-pushed: GitHub → Settings → Developer settings → Personal access tokens. It was
-never used successfully (the proxy blocked it) and was not written to any file
-in this repo — but it did appear in a chat transcript, so revoke it anyway.
-
-## Verify before you push
-
-```bash
-cd "C:\Users\HP\OneDrive\Coding Projects\Basics Genai\llmadapt"
-PYTHONPATH=src python3 tests/run_all.py
+$env:PYTHONPATH="src"; python tests\run_all.py
 ```
 
 Expected: `SUITE PASSED: 14 files, 275 checks`.
-
-On Windows PowerShell:
-
-```powershell
-$env:PYTHONPATH="src"; python tests\run_all.py
-```
