@@ -11,12 +11,15 @@ attached (see policy.py), a rank or an individual employee can be routed
 automatically between local and API models, steered by an effort/priority
 hint that is accepted at hire time and per task.
 
+(Phase 5) Skills, personalities, org templates and org-chart palettes all
+come from ONE named-preset registry (presets.py) - hire(skills=, personality=),
+build_from_template(), render_org_chart(palette=). Team's long-dormant
+`reviewer` field now actually reviews; see Team's docstring for the decision.
+
 Deliberately NOT in this file yet (later phases, see the architecture doc /
 company-roadmap.md):
-  - skills/personality presets, default org templates, stub-and-fill delegation,
-    and swappable color palettes for render_org_chart (Phase 5 - all four are
-    meant to share one named-preset registry pattern, not be built separately)
-  - the compressor.py-based log cleanup/compaction pass (still Phase 7) - logs
+  - stub-and-fill delegation and plan-then-execute (Phase 6)
+  - the compressor.py-based log cleanup/compaction pass (Phase 7) - logs
     are recorded and queryable now, but nothing prunes or summarizes them yet
   - set_company_up() text/GUI company builder (Phase 8)
 
@@ -29,7 +32,7 @@ surprise later.
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .budget import BudgetLedger
 from .core import Agent
@@ -105,6 +108,8 @@ class Employee:
         effort: Optional[str] = None,
         specialty: Optional[str] = None,
         model_decision: Optional[Any] = None,
+        skills: Optional[List[Any]] = None,
+        personality: Optional[Any] = None,
     ):
         self.name = name
         self.rank = rank
@@ -118,6 +123,12 @@ class Employee:
         self.effort = effort
         self.specialty = specialty
         self.model_decision = model_decision
+        # Phase 5: the presets this employee was built from, kept for the
+        # record (and for Phase 8's "what got built" return value). Changing
+        # them here does NOT re-template the system instruction - that is
+        # composed once at hire() time.
+        self.skills: List[Any] = list(skills or [])
+        self.personality = personality
         self._subordinates: List["Employee"] = []
         if reports_to is not None:
             reports_to._subordinates.append(self)
@@ -203,21 +214,140 @@ class Employee:
         return self._escalate(event, task, company)
 
 
+# Wording of the review request handed to a Team's reviewer, and of the
+# revision request handed back to the lead. Module-level constants rather than
+# inline f-strings so a caller can see (and, if they must, monkeypatch) the
+# exact prompts driving the review loop.
+_REVIEW_PROMPT = (
+    "You are reviewing a colleague's work before it is delivered.\n\n"
+    "ORIGINAL TASK:\n{task}\n\n"
+    "THEIR WORK:\n{draft}\n\n"
+    "If the work adequately completes the task, reply with exactly: APPROVED\n"
+    "Otherwise, reply with a short, specific list of what must change. Do not "
+    "rewrite the work yourself, and do not raise problems that are not there."
+)
+
+_REVISION_PROMPT = (
+    "A reviewer asked for changes to your work.\n\n"
+    "ORIGINAL TASK:\n{task}\n\n"
+    "YOUR PREVIOUS ANSWER:\n{draft}\n\n"
+    "REVIEWER'S NOTES:\n{critique}\n\n"
+    "Produce the corrected version. Output only the corrected work."
+)
+
+
+def _looks_approved(text: str) -> bool:
+    """Whether a reviewer's reply counts as sign-off.
+
+    A convention, not a protocol: the reviewer is *asked* to reply exactly
+    "APPROVED", and this checks the opening of the reply for that word while
+    rejecting the obvious negations ("not approved", "cannot be approved").
+    A structured tool call would be stricter, but it would force every
+    reviewer onto a tool-calling-capable model, which the cheap local tiers
+    this library targets often are not. Flagged as a v1 simplification: a
+    reviewer that buries "APPROVED" in the middle of a critique will be read
+    as approving.
+    """
+    head = (text or "").strip()[:200].lower()
+    if not head:
+        return False
+    for negation in ("not approved", "cannot approve", "can't approve", "do not approve", "isn't approved"):
+        if negation in head:
+            return False
+    return head.startswith("approved") or head.startswith("**approved") or head.startswith("# approved")
+
+
 class Team:
     """A company inside a company: a bounded group of Employees with a lead,
-    and - per the plan - at least one reviewer by default."""
+    and - per the plan - at least one reviewer by default.
 
-    def __init__(self, name: str, lead: Employee, reviewer: Optional[Employee] = None):
+    (Phase 5) The reviewer is finally *used*. Until now `reviewer` was a
+    structural field that `run()` ignored, which the handoff notes flagged as
+    needing a decision rather than just an implementation. The decision:
+
+      review_mode="critique" (default) - the lead produces a draft, the
+        reviewer is asked to either sign off or list what must change, and a
+        requested change goes back to the lead for a bounded number of
+        revision rounds. Chosen over the alternatives because it is the only
+        one where the reviewer's opinion can actually change the delivered
+        output, which is what "reviewer" means outside this codebase.
+      review_mode="append" - the reviewer independently answers the same task
+        and both answers are returned, labelled. Cheaper to reason about and
+        occasionally what you want (two opinions, human picks), but it is a
+        second opinion, not a review.
+      review_mode="off" - the pre-Phase-5 behavior: lead only.
+
+    `max_review_rounds` defaults to **1**, not unlimited. An unbounded
+    critique loop is a budget hazard of exactly the kind Phase 3 exists to
+    prevent - two agents can disagree forever - and the token cost of a
+    review round is real. If the reviewer still objects after the last round,
+    the lead's final answer is returned *with the outstanding critique
+    appended*, rather than silently dropping the objection or raising: the
+    caller gets the work plus the unresolved concern, and can decide.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        lead: Employee,
+        reviewer: Optional[Employee] = None,
+        review_mode: str = "critique",
+        max_review_rounds: int = 1,
+    ):
+        if review_mode not in ("critique", "append", "off"):
+            raise ValueError(f"unknown review_mode {review_mode!r} - use 'critique', 'append', or 'off'")
         self.name = name
         self.lead = lead
         self.reviewer = reviewer
-        self.members: List[Employee] = [lead] + ([reviewer] if reviewer else [])
+        self.review_mode = review_mode
+        self.max_review_rounds = max(0, int(max_review_rounds))
+        self.members: List[Employee] = [lead] + ([reviewer] if reviewer and reviewer is not lead else [])
 
     def add_member(self, employee: Employee) -> None:
-        self.members.append(employee)
+        if employee not in self.members:
+            self.members.append(employee)
 
     def run(self, task: str, company: Optional["Company"] = None) -> str:
-        return self.lead.run(task, company=company)
+        draft = self.lead.run(task, company=company)
+        if self.reviewer is None or self.reviewer is self.lead or self.review_mode == "off":
+            return draft
+        if self.review_mode == "append":
+            second = self.reviewer.run(task, company=company)
+            self._log(company, "review_append", rounds=0)
+            return f"## {self.lead.name}\n{draft}\n\n## {self.reviewer.name} (reviewer)\n{second}"
+
+        # max_review_rounds counts how many times work can be sent *back*, so
+        # there is always one more review than revision: the final revision
+        # gets looked at before it ships. Without that last pass, a revised
+        # draft would go out carrying a critique that was written about the
+        # version before it - misleading in exactly the place honesty matters.
+        critique = ""
+        for round_index in range(self.max_review_rounds + 1):
+            critique = self.reviewer.run(
+                _REVIEW_PROMPT.format(task=task, draft=draft), company=company
+            )
+            if _looks_approved(critique):
+                self._log(company, "review_approved", rounds=round_index)
+                return draft
+            if round_index == self.max_review_rounds:
+                break  # no revisions left
+            draft = self.lead.run(
+                _REVISION_PROMPT.format(task=task, draft=draft, critique=critique), company=company
+            )
+            self._log(company, "review_revised", rounds=round_index + 1)
+
+        # Out of rounds with an objection still standing: deliver the work and
+        # the objection together rather than hiding either one.
+        self._log(company, "review_unresolved", rounds=self.max_review_rounds)
+        return (
+            f"{draft}\n\n---\n[Unresolved reviewer note from {self.reviewer.name} after "
+            f"{self.max_review_rounds} revision round(s):]\n{critique}"
+        )
+
+    def _log(self, company: Optional["Company"], kind: str, **fields: Any) -> None:
+        if company is not None:
+            company._log(kind, employee=self.lead.name, team=self.name,
+                         reviewer=(self.reviewer.name if self.reviewer else None), **fields)
 
 
 class Company:
@@ -236,6 +366,7 @@ class Company:
         rank_budget_shares: Optional[Dict[str, float]] = None,
         quota: Optional[ResourceQuota] = None,
         model_policy: Optional[Any] = None,
+        presets: Optional[Any] = None,
     ):
         """
         model_map: rank -> {"provider": ..., "model": ..., "api_key": ...,
@@ -249,6 +380,11 @@ class Company:
             cost/specialty catalog for the API side. Without a model_policy,
             "mode" is still inert and provider/model are taken literally, so
             existing configs behave exactly as before.
+        presets: an optional presets.PresetBundle - the four named-preset
+            registries (skills, personalities, palettes, org templates) this
+            company resolves names against. Defaults to the shared built-in
+            registries; pass `default_bundle().fork()` for a private copy that
+            custom registrations won't leak out of.
         model_policy: an optional policy.ModelPolicy. When present, any rank
             or employee whose resolved mode is "local"/"api"/"auto" gets its
             provider/model chosen by the policy instead of read from
@@ -289,6 +425,11 @@ class Company:
         self.budget = BudgetLedger(total_token_budget, rank_budget_shares)
         self.quota = quota
         self.model_policy = model_policy
+        if presets is None:
+            from .presets import default_bundle
+
+            presets = default_bundle()
+        self.presets = presets
         self.teams: List[Team] = []
         self.employees: Dict[str, Employee] = {}
         self.activity_log: List[Dict[str, Any]] = []
@@ -307,6 +448,8 @@ class Company:
         effort: Optional[str] = None,
         specialty: Optional[str] = None,
         mode: Optional[str] = None,
+        skills: Sequence[Any] = (),
+        personality: Optional[Any] = None,
         **agent_kwargs: Any,
     ) -> Employee:
         """Builds an Agent for `rank` from model_map, wraps it as an Employee,
@@ -337,6 +480,14 @@ class Company:
         Note that effort deliberately does NOT change `importance` - see
         policy.suggested_importance() for the explicit opt-in bridge and
         policy.py's module docstring for why they stay separate knobs.
+
+        (Phase 5) skills/personality are names from this company's
+        PresetBundle (or Skill/Personality objects directly, for one-offs that
+        need no registration). They are templated into the system instruction
+        by presets.compose_system_instruction(), appended after whatever
+        `system_instruction` you passed - your text stays first and is never
+        rewritten. A skill may also *suggest* an effort/specialty for the
+        Phase 4 policy, used only when you did not pass your own.
         """
         if name in self.employees:
             raise ValueError(f"'{name}' is already hired - names must be unique within a Company.")
@@ -346,6 +497,21 @@ class Company:
 
         effort = effort if effort is not None else rank_config.get("effort")
         specialty = specialty if specialty is not None else rank_config.get("specialty")
+
+        skills = list(skills or rank_config.get("skills", ()))
+        personality = personality if personality is not None else rank_config.get("personality")
+        if skills or personality:
+            from .presets import compose_system_instruction, skill_hints
+
+            system_instruction = compose_system_instruction(
+                base=system_instruction, personality=personality, skills=skills,
+                bundle=self.presets, role_line=f"You are {name}, a {rank} at {self.name}.",
+            )
+            hints = skill_hints(skills, bundle=self.presets)
+            # A skill's suggestion is a fallback only - an explicit argument,
+            # a rank_config entry, or a rank default all outrank it.
+            effort = effort if effort is not None else hints["effort"]
+            specialty = specialty if specialty is not None else hints["specialty"]
 
         resolved_provider = provider or rank_config.get("provider", "ollama")
         resolved_model = model or rank_config.get("model")
@@ -375,6 +541,8 @@ class Company:
             name=name, rank=rank, agent=agent, reports_to=reports_to, importance=importance,
             effort=effort, specialty=specialty, model_decision=decision,
         )
+        employee.skills = list(skills)
+        employee.personality = personality
         if reports_to is not None:
             reports_to.agent.add_tool(employee.delegate_tool(company=self))
 
@@ -487,6 +655,115 @@ class Company:
         self.teams.append(team)
         for member in team.members:
             self.employees.setdefault(member.name, member)
+
+    def build_from_template(
+        self,
+        template: Any,
+        size: str = "small",
+        name_prefix: str = "",
+        review_mode: str = "critique",
+        max_review_rounds: int = 1,
+        **hire_overrides: Any,
+    ) -> Team:
+        """Instantiate a whole org shape from a named org template (Phase 5).
+
+        template: a name in this company's org-template registry, or an
+            OrgTemplate object.
+        size: "small" | "medium" | "large". **Opt-in scaling** - the size is
+            an argument, never inferred from a task string. A template's roles
+            declare how many copies of themselves exist at each size, so
+            "large" typically multiplies the worker tiers while leaving the
+            oversight roles alone. Inferring this from the task would mean
+            guessing at spend on the user's behalf, which is the thing Phase
+            3's budget governance exists to prevent.
+        name_prefix: prepended to every employee name, so the same template
+            can be instantiated twice in one Company without name collisions
+            (names must be unique - hire() enforces that).
+        review_mode / max_review_rounds: passed to the Team - see Team's
+            docstring for what "review" means and why the round count is
+            bounded.
+        **hire_overrides: forwarded to every hire() call (e.g. mode="auto" to
+            put the whole template under the Phase 4 model policy).
+
+        Returns the Team, already registered with this Company. Its lead is
+        the role marked lead=True (falling back to the highest-ranked role),
+        and its reviewer is the first role marked reviewer=True. Employees are
+        created parents-first so `reports_to` is always already hired.
+        """
+        template = self.presets.org_templates.resolve(template)
+        template.validate()
+        roles = template.roles_for(size)
+        role_keys = {r.key for r in roles}
+
+        # Parents before children, so reports_to always resolves. A role whose
+        # manager doesn't exist at this size reports to that manager's own
+        # manager instead (walking up until something exists, or None) - that
+        # keeps a template usable at "small" without needing a separate
+        # small-only copy of it with rewritten reporting lines.
+        def effective_manager(role: Any) -> Optional[str]:
+            cursor = role.reports_to
+            while cursor is not None and cursor not in role_keys:
+                cursor = template.role(cursor).reports_to
+            return cursor
+
+        ordered: List[Any] = []
+        placed: set = set()
+        remaining = list(roles)
+        while remaining:
+            progressed = False
+            for role in list(remaining):
+                manager = effective_manager(role)
+                if manager is None or manager in placed:
+                    ordered.append(role)
+                    placed.add(role.key)
+                    remaining.remove(role)
+                    progressed = True
+            if not progressed:  # validate() rules this out, but never loop forever
+                raise ValueError(f"template {template.name!r} could not be ordered - check reports_to")
+
+        by_key: Dict[str, Employee] = {}
+        for role in ordered:
+            manager_key = effective_manager(role)
+            manager = by_key.get(manager_key) if manager_key else None
+            count = role.count_for(size)
+            for index in range(count):
+                title = role.display_title()
+                suffix = f" {index + 1}" if count > 1 else ""
+                employee = self.hire(
+                    name=f"{name_prefix}{title}{suffix}",
+                    rank=role.rank,
+                    reports_to=manager,
+                    skills=role.skills,
+                    personality=role.personality,
+                    effort=role.effort,
+                    specialty=role.specialty,
+                    importance=role.importance,
+                    **hire_overrides,
+                )
+                if index == 0:
+                    by_key[role.key] = employee
+
+        lead_role = next((r for r in ordered if r.lead), None)
+        if lead_role is None:
+            lead_role = min(ordered, key=lambda r: RoleRank.ORDER.index(r.rank)
+                            if r.rank in RoleRank.ORDER else len(RoleRank.ORDER))
+        reviewer_role = next((r for r in ordered if r.reviewer), None)
+
+        team = Team(
+            name=f"{name_prefix}{template.team_name or template.name}",
+            lead=by_key[lead_role.key],
+            reviewer=by_key[reviewer_role.key] if reviewer_role else None,
+            review_mode=review_mode,
+            max_review_rounds=max_review_rounds,
+        )
+        for role in ordered:
+            for employee in self.employees.values():
+                if employee not in team.members and employee.name.startswith(f"{name_prefix}{role.display_title()}"):
+                    team.add_member(employee)
+        self.add_team(team)
+        self._log("team_built", employee=team.lead.name, team=team.name,
+                  template=template.name, size=size, headcount=len(team.members))
+        return team
 
     def run(
         self,
@@ -706,7 +983,7 @@ class Company:
         roots = [e for e in self.employees.values() if e.reports_to is None]
         return {"company": self.name, "org": [node(r) for r in roots]}
 
-    def render_org_chart(self, fmt: str = "ascii", theme: str = "light") -> str:
+    def render_org_chart(self, fmt: str = "ascii", theme: str = "light", palette: Optional[Any] = None) -> str:
         """Renders the current org chart as text or a graphic.
 
         fmt="ascii"   - a tree-command-style text rendering, zero deps, prints
@@ -717,16 +994,24 @@ class Company:
                          renderer) - write the returned string to a .svg file
                          and open it in any browser. theme="dark" switches to
                          the dark-surface palette.
+        palette       - (Phase 5) a name from this company's palette registry
+                         ("dataviz" default, plus "grayscale"/"ocean"/"ember"),
+                         or a Palette object. Resolved through the same
+                         PresetRegistry mechanism as skills and templates -
+                         palettes are not a separate system. Ignored by
+                         fmt="ascii", which has no colors.
         """
         from . import observability
 
         chart = self.org_chart()
+        if palette is not None:
+            palette = self.presets.palettes.resolve(palette)
         if fmt == "ascii":
             return observability.render_org_chart_ascii(chart)
         if fmt == "mermaid":
-            return observability.render_org_chart_mermaid(chart, theme=theme)
+            return observability.render_org_chart_mermaid(chart, theme=theme, palette=palette)
         if fmt == "svg":
-            return observability.render_org_chart_svg(chart, theme=theme)
+            return observability.render_org_chart_svg(chart, theme=theme, palette=palette)
         raise ValueError(f"Unknown render_org_chart fmt '{fmt}' - use 'ascii', 'mermaid', or 'svg'.")
 
     def activity(self) -> "EventLog":

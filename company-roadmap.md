@@ -149,17 +149,85 @@ produced (`test_full.py` was asserting the latter). Added `tests/run_all.py`,
 a dependency-free whole-suite runner (skips `test_trial_own.py`, an
 interactive REPL rather than a test).
 
-## Not built yet
+**Phase 5 — one named-preset registry** (`presets.py`, `company.py`, `observability.py`)
+`PresetRegistry` is the mechanism, instantiated four times — `SKILLS`,
+`PERSONALITIES`, `PALETTES`, `ORG_TEMPLATES`. Same class, same API
+(`get`/`register`/`resolve`/`names`/`copy`) for all four. That was the explicit
+correction to honor: palettes are picked by name through the *same* mechanism
+as skills, not a bespoke colour system inside `observability.py`, and org
+templates are not a bespoke system inside `company.py`.
 
-**Phase 5 — skills/personality presets, default org templates, color palettes**
-A **single named-preset registry pattern**, reused identically across skills,
-personality presets, team/company templates, and now color palettes (per this
-session's note: ready-made palettes + user-added custom ones, referenced by
-name — same mechanism as skills/teams, not a bespoke system bolted onto
-`observability.py`). Presets determine system-instruction templating. Skills
-can carry constraints ("don't use library X"). Default org templates (e.g.
-"small coding team": 1 reviewer + 1 C-suite + 1 manager) scale with task size
-when the user opts in.
+What committing to one mechanism actually bought:
+- `resolve()` takes a **name or the object**, so `hire(skills=["python"])` and
+  `hire(skills=[Skill(...)])` both work and a one-off preset needs no
+  registration (passing an object deliberately does *not* register it).
+- `names()` is where Phase 8's schema enums come from — one method, four kinds,
+  via `PresetBundle.names()`/`describe()`.
+- `PresetBundle.fork()` gives a Company private membership, so registering a
+  custom skill can't leak into another Company in the same process (or another
+  test). Presets are treated as immutable value objects, so a fork isolates
+  membership only.
+- `get()` raises listing what *is* available and never returns None — a typo'd
+  skill name would otherwise silently produce an employee with no skills.
+  `register()` refuses to shadow an existing name without `overwrite=True`.
+
+`compose_system_instruction()` templates base → role line → personality →
+skills → constraints, in a **fixed order**, because a system instruction that
+reshuffles between runs makes prompt caching useless and behavior changes
+impossible to attribute. Constraints are pooled across skills and deduplicated.
+With no presets it returns `""`, so a pre-Phase-5 hire is byte-identical.
+
+Skills carry a `specialty`/`effort` hint that feeds **Phase 4's policy** — but
+only as a fallback; an explicit `hire(specialty=…)` always wins. That is what
+makes the two phases one system rather than two.
+
+Org templates (`OrgTemplate`/`RoleSpec`) are declarative — roles refer to each
+other by key, and `validate()` catches dangling reporting lines, cycles, and
+duplicate leads before anything is half-built. **Scaling is opt-in**:
+`build_from_template(name, size=…)` takes the size as an argument and never
+infers it from the task text, because inferring it means guessing at spend on
+the user's behalf — the thing Phase 3 exists to prevent. Roles declare
+`count_by_size`, so "large" multiplies worker tiers while leaving oversight
+roles alone, and a role whose manager doesn't exist at a smaller size reports
+to that manager's manager instead (so one template works at every size without
+a rewritten small-only copy). Built-ins: `solo`, `small-coding-team` (the
+roadmap's reference shape), `research-pod`, `writing-desk`.
+
+Palettes: `dataviz` (the pre-Phase-5 colours, still the default, so every
+existing `render_org_chart()` call renders identically), plus `grayscale`,
+`ocean`, `ember`. **Only `dataviz` claims the colourblind-safe validation** —
+the others are stylistic and say so, rather than implying validation by sitting
+in the same list.
+
+**Resolves open question #3 — `Team.reviewer` now actually reviews.** The
+decision (it needed one, not just an implementation): `review_mode="critique"`
+is the default — the lead drafts, the reviewer either signs off or lists what
+must change, and a requested change goes back to the lead. Chosen because it is
+the only option where the reviewer's opinion can change the delivered output,
+which is what "reviewer" means outside this codebase. The alternatives are kept
+as modes rather than discarded: `"append"` (reviewer independently answers, both
+returned labelled — a second opinion, not a review) and `"off"` (exactly the
+pre-Phase-5 lead-only behavior).
+
+Two deliberate bounds on that loop, both cost-driven:
+- `max_review_rounds` defaults to **1**, counting *send-backs*. Two agents can
+  disagree forever and each round costs real tokens — an unbounded critique
+  loop is precisely the hazard Phase 3 exists to prevent.
+- There is always **one more review than revision**, so the final revision is
+  looked at before it ships. Without that pass a revised draft would go out
+  carrying a critique written about the previous version.
+- If an objection still stands when the rounds run out, the work ships **with
+  the outstanding critique appended** rather than the objection being silently
+  dropped or an exception raised. The caller gets both and decides.
+
+Flagged simplification: approval detection is a *convention* — the reviewer is
+asked to reply exactly `APPROVED` and `_looks_approved()` checks the opening of
+the reply (rejecting obvious negations). A structured tool call would be
+stricter but would force every reviewer onto a tool-calling-capable model,
+which the cheap local tiers this library targets often are not. A reviewer that
+buries "APPROVED" mid-critique will be misread.
+
+## Not built yet
 
 **Phase 6 — stub-and-fill delegation**
 Higher tiers emit function signatures + docstrings + type hints, cheaper
@@ -199,7 +267,8 @@ Two builds under one name, different scope entirely:
 2. Ready-made color palettes + custom palette support for `render_org_chart`
    (deferred until Phase 5's named-preset registry exists) — addressed by
    Phase 5's palette registry.
-3. **`Team.reviewer` is structural only** — `Team.__init__` stores a reviewer
+3. ~~**`Team.reviewer` is structural only**~~ **Resolved in Phase 5** — see the
+   Phase 5 entry for the decision and its bounds. Original note: — `Team.__init__` stores a reviewer
    and the class comment promises "at least one reviewer by default", but
    `Team.run()` just calls `self.lead.run(...)` and the reviewer is never
    invoked. Needs a *decision* on what review means (reviewer also gets the

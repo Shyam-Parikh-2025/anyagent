@@ -5,6 +5,12 @@ from .hardware import ResourceQuota, HardwareProfiler, MoELayerOffloader, LocalM
 from .company import Company, Employee, Team, EscalationEvent, EscalationDecision, EscalationUnresolved
 from .budget import BudgetLedger
 from .policy import ModelPolicy, ApiModelCatalog, ApiModelSpec, PolicyDecision, suggested_importance
+from .presets import (
+    Preset, PresetRegistry, PresetBundle, default_bundle,
+    Skill, Personality, Palette, OrgTemplate, RoleSpec,
+    SKILLS, PERSONALITIES, PALETTES, ORG_TEMPLATES,
+    compose_system_instruction,
+)
 
 __all__ = [
     "Agent",
@@ -30,5 +36,19 @@ __all__ = [
     "ApiModelSpec",
     "PolicyDecision",
     "suggested_importance",
+    "Preset",
+    "PresetRegistry",
+    "PresetBundle",
+    "default_bundle",
+    "Skill",
+    "Personality",
+    "Palette",
+    "OrgTemplate",
+    "RoleSpec",
+    "SKILLS",
+    "PERSONALITIES",
+    "PALETTES",
+    "ORG_TEMPLATES",
+    "compose_system_instruction",
 ]
 __version__ = "0.2.0"
