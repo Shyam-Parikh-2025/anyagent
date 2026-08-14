@@ -16,9 +16,11 @@ come from ONE named-preset registry (presets.py) - hire(skills=, personality=),
 build_from_template(), render_org_chart(palette=). Team's long-dormant
 `reviewer` field now actually reviews; see Team's docstring for the decision.
 
+(Phase 6) run_structured(task, strategy="direct"|"plan"|"stub_fill") routes a
+task through delegation.py's decomposition strategies.
+
 Deliberately NOT in this file yet (later phases, see the architecture doc /
 company-roadmap.md):
-  - stub-and-fill delegation and plan-then-execute (Phase 6)
   - the compressor.py-based log cleanup/compaction pass (Phase 7) - logs
     are recorded and queryable now, but nothing prunes or summarizes them yet
   - set_company_up() text/GUI company builder (Phase 8)
@@ -792,6 +794,58 @@ class Company:
         self._log("task_start", employee=start.name, task=task[:200])
         result = start.run(task, company=self)
         self._log("task_end", employee=start.name)
+        return result
+
+    def run_structured(
+        self,
+        task: str,
+        strategy: str = "direct",
+        entry_point: Optional[Employee] = None,
+        effort: Optional[str] = None,
+        specialty: Optional[str] = None,
+        **strategy_kwargs: Any,
+    ) -> Any:
+        """(Phase 6) Run a task through a decomposition strategy.
+
+        strategy="direct"    - exactly `run()`: the entry point handles it,
+                               delegating through its normal tools. Returns a
+                               string.
+        strategy="plan"      - plan-then-execute (delegation.plan_then_execute).
+                               Returns a PlanResult.
+        strategy="stub_fill" - stub-and-fill (delegation.stub_and_fill). The
+                               senior tier writes signatures + docstrings, the
+                               cheap tiers write bodies. Returns a
+                               StubAndFillResult.
+
+        The two structured strategies return result *objects*, not strings,
+        because "did every step succeed?" and "which stubs came back unfilled?"
+        are the questions a caller actually has, and a string answer can't
+        carry them. `.answer` / `.code` hold the deliverable.
+
+        effort/specialty behave as in run(): they re-route the entry point
+        (here, the architect/planner) through the Phase 4 policy for this task.
+        """
+        start = entry_point or self._default_entry_point()
+        if start is None:
+            raise ValueError("Company has no employees - call hire() before run_structured().")
+        if (effort is not None or specialty is not None) and self.model_policy is not None:
+            self.reassign_model(start, effort=effort, specialty=specialty)
+
+        if strategy == "direct":
+            return self.run(task, entry_point=start)
+
+        from . import delegation
+
+        self._log("strategy_start", employee=start.name, strategy=strategy, task=task[:200])
+        if strategy == "plan":
+            result = delegation.plan_then_execute(self, task, planner=start, **strategy_kwargs)
+        elif strategy == "stub_fill":
+            result = delegation.stub_and_fill(self, task, architect=start, **strategy_kwargs)
+        else:
+            raise ValueError(
+                f"unknown strategy {strategy!r} - use 'direct', 'plan', or 'stub_fill'"
+            )
+        self._log("strategy_done", employee=start.name, strategy=strategy, ok=result.ok)
         return result
 
     def _default_entry_point(self) -> Optional[Employee]:

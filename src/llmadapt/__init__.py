@@ -11,6 +11,10 @@ from .presets import (
     SKILLS, PERSONALITIES, PALETTES, ORG_TEMPLATES,
     compose_system_instruction,
 )
+from .delegation import (
+    stub_and_fill, plan_then_execute, extract_stubs, assemble_module,
+    StubPlan, StubAndFillResult, PlanResult,
+)
 
 __all__ = [
     "Agent",
@@ -50,5 +54,12 @@ __all__ = [
     "PALETTES",
     "ORG_TEMPLATES",
     "compose_system_instruction",
+    "stub_and_fill",
+    "plan_then_execute",
+    "extract_stubs",
+    "assemble_module",
+    "StubPlan",
+    "StubAndFillResult",
+    "PlanResult",
 ]
 __version__ = "0.2.0"

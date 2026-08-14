@@ -227,13 +227,75 @@ stricter but would force every reviewer onto a tool-calling-capable model,
 which the cheap local tiers this library targets often are not. A reviewer that
 buries "APPROVED" mid-critique will be misread.
 
-## Not built yet
+**Phase 6 — task decomposition: stub-and-fill + plan-then-execute** (`delegation.py`)
+Both strategies in one module, deliberately. They are the same idea at
+different granularities — a more capable agent decides the *shape*, cheaper
+agents fill it in — and splitting them would create two competing
+decomposition systems, which is what the roadmap warned about when it folded
+"plan-then-execute" (open question #4) into this phase.
 
-**Phase 6 — stub-and-fill delegation**
-Higher tiers emit function signatures + docstrings + type hints, cheaper
-tiers fill bodies. Fixed by rank in v1 (not a dynamically-decided
-decomposition-depth algorithm — no clean formula for that; treat it as a
-research-adjacent stretch goal, not a v1 requirement).
+*stub-and-fill*: the architect emits a module of signatures + docstrings +
+type hints with `...` bodies; implementers fill one body each; results are
+reassembled. **Reuses `ContextCompressor.code_to_stub()`** rather than writing
+a second AST layer — it already produces exactly the signature+docstring+`...`
+shape, so it normalizes the architect's output into the interface implementers
+see (a chatty architect that half-implements something still hands over a clean
+interface).
+
+*plan-then-execute*: the planner emits a numbered plan, steps run in order, and
+each step sees a **compressed digest** of earlier results
+(`compress_tool_output`, the same machinery tool results already use) rather
+than their full text — feeding every prior step's output into every later step
+is how a five-step plan becomes a context-window failure. `synthesize=True`
+gives the planner a final pass; set it False when the last step is already the
+deliverable.
+
+**Fixed by rank in v1**, as decided: `DEFAULT_ARCHITECT_RANKS` (most senior
+first — architecting is the leverage point, a bad interface makes every filled
+body wrong) and `DEFAULT_IMPLEMENTER_RANKS` (cheapest first — bodies are the
+high-volume, low-leverage part, which is the economic point). Implementers get
+stubs round-robin, deliberately *not* "best implementer per stub", because
+ranking stubs by difficulty needs exactly the dynamic-decomposition judgment
+this phase decided not to fake.
+
+Failure handling is the bulk of the design, since both strategies are driven by
+model output that will sometimes be malformed. Nothing raises for a
+model-quality failure — everything lands on the result object and in the
+activity log:
+- unparseable architect module → `parse_error`, and **no implementer is
+  called** (nobody pays for an unusable plan)
+- implementer returns another stub, or renames the function → that stub is
+  reported `unfilled` rather than silently accepted; a surviving `...` would
+  produce a syntactically valid module that does nothing, the worst failure
+  mode available here
+- unfilled stubs stay **visible in the assembled module** under an
+  `# UNFILLED (reason):` comment rather than being dropped, so the artifact
+  says where it is incomplete
+- architect returns no stubs → its answer is returned verbatim rather than
+  inventing stubs to justify the strategy
+- a plan that doesn't parse → the whole task runs as a single step with
+  `degraded=True`, rather than failing
+- a step that raises → recorded on that step; the remaining steps still run
+
+`MAX_STUBS` (20) and `MAX_PLAN_STEPS` (12) are runaway guards in the same
+spirit as Phase 3's budget ceiling and Phase 5's `max_review_rounds`: each stub
+and each step is a real model call, and a model asked to decompose a vague task
+will happily produce forty.
+
+`Company.run_structured(task, strategy=…)` is the entry point; the structured
+strategies return result *objects*, not strings, because "did every step
+succeed?" and "which stubs came back unfilled?" are the questions a caller
+actually has. `effort`/`specialty` work as in `run()`, re-routing the
+architect/planner through the Phase 4 policy.
+
+Stated limits: nothing here executes or tests the generated code —
+assembly is checked with `compile()` for **syntax only**, so a confidently
+wrong body assembles cleanly. An implementer that keeps the function name but
+changes the parameter list is accepted as-is. Plan-step parsing is a
+numbered-list regex over prose; models are good at numbered lists and bad at
+guarantees, which is why the no-match path degrades instead of erroring.
+
+## Not built yet
 
 **Phase 7 — log compaction**
 The `compressor.py`-based "keep broad concepts, drop specifics" cleanup pass
@@ -275,7 +337,8 @@ Two builds under one name, different scope entirely:
    task and their output is appended? reviewer critiques the lead's output and
    can send it back?), not just an implementation. Folded into Phase 5, which
    owns team templates.
-4. **"Plan-then-execute for complex tasks"** was in the original spec alongside
+4. ~~**"Plan-then-execute for complex tasks"**~~ **Resolved in Phase 6** — built
+   alongside stub-and-fill in `delegation.py`. Original note: was in the original spec alongside
    stub-and-fill and skills, but had no home in Phases 4-8. Folded into Phase 6
    — stub-and-fill is itself a form of planning, and doing both in one module
    avoids two competing task-decomposition systems.
