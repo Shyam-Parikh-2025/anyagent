@@ -12,6 +12,10 @@ from .presets import (
     compose_system_instruction,
 )
 from .compaction import LogCompactionPolicy, ALWAYS_KEEP_KINDS
+from .builder import (
+    set_company_up, set_up_company, build_company, CompanySpec, EmployeeSpec,
+    company_setup_schema, company_options, register_company_builder,
+)
 from .delegation import (
     stub_and_fill, plan_then_execute, extract_stubs, assemble_module,
     StubPlan, StubAndFillResult, PlanResult,
@@ -64,5 +68,13 @@ __all__ = [
     "PlanResult",
     "LogCompactionPolicy",
     "ALWAYS_KEEP_KINDS",
+    "set_company_up",
+    "set_up_company",
+    "build_company",
+    "CompanySpec",
+    "EmployeeSpec",
+    "company_setup_schema",
+    "company_options",
+    "register_company_builder",
 ]
 __version__ = "0.2.0"
