@@ -19,10 +19,12 @@ build_from_template(), render_org_chart(palette=). Team's long-dormant
 (Phase 6) run_structured(task, strategy="direct"|"plan"|"stub_fill") routes a
 task through delegation.py's decomposition strategies.
 
+(Phase 7) Company(log_compaction=LogCompactionPolicy(...)) compacts the
+activity/tool-call logs after every completed top-level task - see
+compaction.py.
+
 Deliberately NOT in this file yet (later phases, see the architecture doc /
 company-roadmap.md):
-  - the compressor.py-based log cleanup/compaction pass (Phase 7) - logs
-    are recorded and queryable now, but nothing prunes or summarizes them yet
   - set_company_up() text/GUI company builder (Phase 8)
 
 This stays a single file for now (observability.py and budget.py split out
@@ -369,6 +371,7 @@ class Company:
         quota: Optional[ResourceQuota] = None,
         model_policy: Optional[Any] = None,
         presets: Optional[Any] = None,
+        log_compaction: Optional[Any] = None,
     ):
         """
         model_map: rank -> {"provider": ..., "model": ..., "api_key": ...,
@@ -382,6 +385,11 @@ class Company:
             cost/specialty catalog for the API side. Without a model_policy,
             "mode" is still inert and provider/model are taken literally, so
             existing configs behave exactly as before.
+        log_compaction: an optional compaction.LogCompactionPolicy. When set
+            (and not mode="off"), the activity/tool-call logs are compacted
+            after every completed top-level task - the Phase 7 "keep broad
+            concepts, drop specifics" pass. Left unset, the logs grow
+            unbounded exactly as they did before Phase 7.
         presets: an optional presets.PresetBundle - the four named-preset
             registries (skills, personalities, palettes, org templates) this
             company resolves names against. Defaults to the shared built-in
@@ -427,6 +435,7 @@ class Company:
         self.budget = BudgetLedger(total_token_budget, rank_budget_shares)
         self.quota = quota
         self.model_policy = model_policy
+        self.log_compaction = log_compaction
         if presets is None:
             from .presets import default_bundle
 
@@ -794,6 +803,7 @@ class Company:
         self._log("task_start", employee=start.name, task=task[:200])
         result = start.run(task, company=self)
         self._log("task_end", employee=start.name)
+        self.compact_logs()
         return result
 
     def run_structured(
@@ -846,6 +856,7 @@ class Company:
                 f"unknown strategy {strategy!r} - use 'direct', 'plan', or 'stub_fill'"
             )
         self._log("strategy_done", employee=start.name, strategy=strategy, ok=result.ok)
+        self.compact_logs()
         return result
 
     def _default_entry_point(self) -> Optional[Employee]:
@@ -1018,6 +1029,30 @@ class Company:
             "emergency_budget_spent": self._emergency_budget_spent,
             "employees": self.budget.report(self.employees),
         }
+
+    def compact_logs(self, policy: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+        """(Phase 7) Run the log compaction pass. Returns a report, or None if
+        no policy is configured.
+
+        Called automatically at the end of every completed top-level task
+        (`run()` / `run_structured()`), which is when the roadmap said the pass
+        should happen - a task boundary is the point at which the specifics of
+        how it got done stop mattering and the broad shape is what you keep.
+        Call it directly to compact on demand.
+
+        Compaction is lossy and irreversible on the live lists. The escalation
+        and budget-authority events are protected from it at every mode - see
+        compaction.ALWAYS_KEEP_KINDS.
+        """
+        policy = policy or self.log_compaction
+        if policy is None:
+            return None
+        report = policy.compact_company(self)
+        if report.get("compacted"):
+            self._log("logs_compacted", employee=None,
+                       events_dropped=report.get("events_dropped"),
+                       tool_calls_dropped=report.get("tool_calls_dropped"))
+        return report
 
     def _log(self, kind: str, **fields: Any) -> None:
         self.activity_log.append({"time": time.time(), "kind": kind, **fields})

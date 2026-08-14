@@ -295,12 +295,48 @@ changes the parameter list is accepted as-is. Plan-step parsing is a
 numbered-list regex over prose; models are good at numbered lists and bad at
 guarantees, which is why the no-match path degrades instead of erroring.
 
-## Not built yet
+**Phase 7 — log compaction** (`compaction.py`, `company.py`)
+The "keep broad concepts, drop specifics" pass over `activity_log` /
+`tool_call_log`, run automatically at the end of every completed top-level task
+(`run()` / `run_structured()`) — a task boundary is exactly when the specifics
+of *how* it got done stop mattering and the shape is what you keep.
 
-**Phase 7 — log compaction**
-The `compressor.py`-based "keep broad concepts, drop specifics" cleanup pass
-over `activity_log`/`tool_call_log` after a task completes. Logs are recorded
-and queryable now (Phase 2); nothing prunes or summarizes them yet.
+**Reuses `compressor.py` twice over**, as instructed — not a second compression
+system:
+- *the code*: `compress_tool_output` shrinks result previews,
+  `_dedupe_repeated_lines` collapses repetition before summarizing,
+  `token_estimate` measures what was saved (so the numbers are comparable with
+  what `CompressionPolicy` budgets against elsewhere).
+- *the pattern*: `LogCompactionPolicy` is deliberately shaped like
+  `HistoryCompactionPolicy` — same three modes (`off`/`algorithmic`/`agent`),
+  same untouched `keep_recent` tail, same trigger threshold, same
+  summarizer-optional contract, same "a typo'd mode degrades to the free/safe
+  path", same "agent mode falls back to algorithmic if the summarizer fails, so
+  choosing it can never break a run". Anyone who has configured history
+  compaction already knows how to configure this.
+
+Algorithmic mode collapses old activity events into one rollup carrying counts
+per kind, the employees involved, and the time span — every individual task
+string dropped. Tool calls group by `(employee, tool_name)` into one row with
+call count, total/mean duration and one compressed example preview, which is
+the useful residue of a thousand identical `delegate_to_worker` calls.
+
+**The one genuinely new decision: what compaction may not touch.** Compaction
+is lossy and irreversible, and these logs are the only record of where the
+money went. `ALWAYS_KEEP_KINDS` protects escalations, escalation decisions,
+emergency-reserve draws and budget reallocations at *every* mode regardless of
+age; tool-call entries that recorded an **error** are likewise never collapsed,
+since an error is the specific thing you go back to a log to find. The rule for
+what belongs on that list: if losing the event would make "who approved this
+spend?" or "what went wrong?" unanswerable after the fact, it stays.
+
+Compaction assigns **in place** (`log[:] = …`) rather than rebinding, because
+Phase 2's `EventLog` deliberately wraps the company's list live — rebinding
+would leave any `EventLog` a caller already holds pointed at the stale list.
+The policy's own methods never mutate the list passed to them; only
+`compact_company()` writes.
+
+## Not built yet
 
 **Phase 8 — `set_company_up(mode="text"|"gui")` (new, this session)**
 Two builds under one name, different scope entirely:

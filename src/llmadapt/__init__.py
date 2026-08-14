@@ -11,6 +11,7 @@ from .presets import (
     SKILLS, PERSONALITIES, PALETTES, ORG_TEMPLATES,
     compose_system_instruction,
 )
+from .compaction import LogCompactionPolicy, ALWAYS_KEEP_KINDS
 from .delegation import (
     stub_and_fill, plan_then_execute, extract_stubs, assemble_module,
     StubPlan, StubAndFillResult, PlanResult,
@@ -61,5 +62,7 @@ __all__ = [
     "StubPlan",
     "StubAndFillResult",
     "PlanResult",
+    "LogCompactionPolicy",
+    "ALWAYS_KEEP_KINDS",
 ]
 __version__ = "0.2.0"
