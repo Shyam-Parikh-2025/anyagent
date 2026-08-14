@@ -349,6 +349,49 @@ class Agent:
         # the agent owning/constructing a compressor instance.
         self.compression_policy = compression_policy or CompressionPolicy()
 
+        # Real per-provider usage, captured from each response as it comes back
+        # (see _extract_usage/_record_usage) - not estimated. company.py's budget
+        # governance (budget.py) reads total_tokens_used directly; usage_log keeps
+        # the per-call detail in case anything needs to reconstruct it later.
+        self.total_tokens_used = 0
+        self.usage_log = []
+
+    def reset_usage(self):
+        """Zeroes the usage counters. Useful for a long-lived Agent being
+        reused across many separate tasks where each task's cost should be
+        measured independently."""
+        self.total_tokens_used = 0
+        self.usage_log = []
+
+    def _extract_usage(self, res: dict) -> dict:
+        """Pulls real input/output token counts out of a raw provider
+        response. Every provider shapes this differently and some responses
+        (e.g. a scripted test double) won't have it at all - missing fields
+        default to 0 rather than raising, since usage reporting is a
+        best-effort governance signal, not something that should ever break
+        an actual chat turn."""
+        try:
+            if self.provider == "anthropic":
+                u = res.get("usage") or {}
+                return {"input": u.get("input_tokens", 0) or 0, "output": u.get("output_tokens", 0) or 0}
+            if self.provider in ("openai", "custom"):
+                u = res.get("usage") or {}
+                return {"input": u.get("prompt_tokens", 0) or 0, "output": u.get("completion_tokens", 0) or 0}
+            if self.provider == "gemini":
+                u = res.get("usageMetadata") or {}
+                return {"input": u.get("promptTokenCount", 0) or 0, "output": u.get("candidatesTokenCount", 0) or 0}
+            if self.provider == "ollama":
+                return {"input": res.get("prompt_eval_count", 0) or 0, "output": res.get("eval_count", 0) or 0}
+        except Exception:
+            pass
+        return {"input": 0, "output": 0}
+
+    def _record_usage(self, res: dict) -> None:
+        usage = self._extract_usage(res)
+        turn_total = usage["input"] + usage["output"]
+        self.total_tokens_used += turn_total
+        self.usage_log.append({"input": usage["input"], "output": usage["output"], "total": turn_total})
+
     def tool(self, python_function: Callable, schema: dict = None):
         """Decorator to register a Python function as a tool with optional schema."""
         if python_function is None:
@@ -533,6 +576,8 @@ class Agent:
     
     # Helper method for processing completed responses
     def process_response(self, res, thinking_visible=False):
+        self._record_usage(res)  # every provider path funnels through here, sync or async
+
         if self.provider == "gemini":
             output = self.process_gemini_response(res, thinking_visible=thinking_visible)
             if output is not None: return output
