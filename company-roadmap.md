@@ -64,17 +64,92 @@ recursive ask-your-manager reallocation, not a global water-filling optimizer
 — that's real scheduling, worth targeting once this simpler version has run
 for a while.
 
-## Not built yet
+**Phase 4 — auto mode model policy (local vs. API)** (`policy.py`, `company.py`)
+`policy.py` adds the layer above `selector.py`/`router.allocate_local_auto`:
+those rank among *local* candidates, this decides whether to be local at all.
 
-**Phase 4 — auto mode model policy (local vs. API)**
-Builds on `benchmark.py`/`selector.py`/`router.py.allocate_local_auto`, which
-today only rank among *local* candidates. Phase 4 adds the local-vs-API
-decision itself — needs a cost/specialty table for API models (start with a
-small user-supplied config, not live-pricing fetch — real scope trap
-otherwise). **New requirement to design in from the start:** the selection
-must accept an optional per-employee/per-task *effort or priority hint*
-("needs effort", "keep it cheap") as an input, not just rank — don't bolt
-this on after Phase 4 ships once the API shape is already fixed.
+`ApiModelSpec`/`ApiModelCatalog` are the user-supplied cost/specialty table
+(per-1k input+output price, a coarse hand-set `capability` 0-1, free-form
+`specialties` tags, optional `context_window`). `DEFAULT_API_CATALOG` seeds
+five common models so a bare `ModelPolicy()` works, but **every seed entry
+carries a `note` saying the numbers are hand-entered and will go stale** —
+there is deliberately no live-pricing fetch (the flagged scope trap). Prices
+are collapsed to one comparable number via `blended_cost_per_1k(output_ratio=
+0.75)`; that ratio is an assumption about agent traffic (short prompts, long
+completions), stated as such — it's a ranking aid, not a spend forecast.
+
+**The effort hint is an input everywhere, from the start** —
+`ModelPolicy.decide(effort=)`, `Company.hire(effort=)`, `Company.run(effort=)`.
+Three levels only (`cheap`/`balanced`/`effort`) with a small fixed alias table
+("needs effort", "keep it cheap", "high", …); three because a user cannot
+calibrate seven levels against a catalog they wrote by hand. An unrecognized
+string falls back to the rank default rather than raising, because in Phase 8
+this value arrives from an LLM filling in a tool schema and a typo shouldn't
+take a running company down. `DEFAULT_RANK_EFFORT` supplies the fallback per
+rank, mirroring `router.allocate_compression_policy`'s rank table.
+
+**The effort hint is what moves the local/API threshold** — that's the actual
+mechanism, not a separate knob bolted next to it:
+- `cheap` — any feasible local model wins, offloaded or not (free beats fast);
+  API only if nothing local fits.
+- `balanced` — local wins *only* at the `gpu_resident` tier (fits entirely in
+  VRAM). A heavily offloaded model is slow enough that a cheap API call is the
+  better trade, so it routes to the API and says so in the decision's `reason`.
+- `effort` — straight to the API catalog without scoring local at all; local
+  only if the API catalog is empty.
+
+Within the API catalog the same hint picks the ranking rule: cheapest blended
+cost / best capability-per-dollar / highest capability. An unmatched specialty
+tag widens to the whole catalog with an explicit note rather than failing.
+
+`PolicyDecision` is returned for every outcome including failure
+(`kind="unavailable"`) rather than raising — same philosophy as
+`SelectionResult.needs_install`. It carries the full `reason` string and the
+raw `SelectionResult` it was based on, and is stored on `Employee.
+model_decision` + logged to `activity_log` as `kind="model_policy"`, so "why
+is this employee on this model?" stays answerable months later.
+
+Failure modes are deliberately asymmetric: `mode="local"` **fails closed**
+(`unavailable` + install hint) because an explicit local request should never
+silently start spending money; `allow_api_fallback=True` opts in. `mode="auto"`
+falls back to the API, since that's the whole point of auto. A policy that
+can't route anything at `hire()` time is **logged and ignored** (the literal
+`model_map` values are used) rather than fatal — a routing miss shouldn't
+abort building an org chart halfway; it resurfaces as a real provider error on
+first request.
+
+`DEFAULT_LOCAL_BINDINGS` bridges selector.py's provider names (which describe
+*where weights live*) to `Agent.change_api`'s transports: ollama → the Ollama
+endpoint; lm-studio → `openai` + localhost:1234; hf/vllm → `openai` +
+localhost:8000, with the decision's reason explicitly warning that raw HF
+weights on disk are not an endpoint.
+
+Per-task (not just per-employee) effort is real: `Company.run(task, effort=)`
+calls `Company.reassign_model()`, which re-decides and swaps the endpoint via
+`Agent.change_api()` — keeping conversation history, registered tools
+(including every `delegate_to_*`), and usage counters. The hint applies to the
+entry point only; delegates keep their own standing hints, since a manager
+finding a task hard doesn't mean every intern touching it needs a frontier
+model. Flagged honestly in the docstring: mid-conversation provider swaps on a
+long tool-heavy history aren't hardened, the intended use is a fresh task.
+
+**Resolved: open question #1 — effort does NOT feed `BudgetLedger.importance`.**
+They answer different questions (how capable a model vs. how large a token
+slice), and coupling them automatically would quietly redefine what
+`importance` means in Phase 3's ledger and make budget reports unreadable.
+Instead `policy.suggested_importance(effort)` is an explicit opt-in bridge the
+caller passes into `hire(importance=...)` themselves. Explicit beats implicit
+where the ledger is the thing standing between this library and a surprise
+bill.
+
+Also fixed while getting the suite green: `core.py`'s
+`process_openai_custom_response` raised a raw `IndexError` on an empty
+`choices` list instead of the clear `RuntimeError` the Gemini path already
+produced (`test_full.py` was asserting the latter). Added `tests/run_all.py`,
+a dependency-free whole-suite runner (skips `test_trial_own.py`, an
+interactive REPL rather than a test).
+
+## Not built yet
 
 **Phase 5 — skills/personality presets, default org templates, color palettes**
 A **single named-preset registry pattern**, reused identically across skills,
@@ -116,14 +191,22 @@ Two builds under one name, different scope entirely:
   ethos rather than pulling in a frontend framework. Meaningfully bigger than
   everything built so far combined — its own phase, tackled last.
 
-## Open questions to resolve before Phase 4 code
+## Open questions
 
-1. Phase 4's local-vs-API decision needs an effort/priority hint input (see
-   above) — worth checking whether that hint should also feed
-   `BudgetLedger.importance` (an expensive/high-effort task arguably deserves
-   a bigger allocation too), or whether keeping "how much budget" and "how
-   capable a model" as separate knobs is the right call. Not resolved yet;
-   flagging so Phase 4 doesn't quietly redefine what `importance` means.
+1. ~~Should the effort hint feed `BudgetLedger.importance`?~~ **Resolved in
+   Phase 4: no.** Kept as separate knobs, with `policy.suggested_importance()`
+   as an explicit opt-in bridge. Reasoning in the Phase 4 entry above.
 2. Ready-made color palettes + custom palette support for `render_org_chart`
-   (Phase 3/4-adjacent idea, explicitly deferred by the user until Phase 5's
-   named-preset registry exists) — still open, still fine to leave for Phase 5.
+   (deferred until Phase 5's named-preset registry exists) — addressed by
+   Phase 5's palette registry.
+3. **`Team.reviewer` is structural only** — `Team.__init__` stores a reviewer
+   and the class comment promises "at least one reviewer by default", but
+   `Team.run()` just calls `self.lead.run(...)` and the reviewer is never
+   invoked. Needs a *decision* on what review means (reviewer also gets the
+   task and their output is appended? reviewer critiques the lead's output and
+   can send it back?), not just an implementation. Folded into Phase 5, which
+   owns team templates.
+4. **"Plan-then-execute for complex tasks"** was in the original spec alongside
+   stub-and-fill and skills, but had no home in Phases 4-8. Folded into Phase 6
+   — stub-and-fill is itself a form of planning, and doing both in one module
+   avoids two competing task-decomposition systems.

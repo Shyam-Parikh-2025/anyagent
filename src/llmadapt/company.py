@@ -6,11 +6,13 @@ raising straight to the caller, (Phase 2) queryable activity/tool-call logs
 plus org-chart rendering (ascii/mermaid/svg) - see observability.py - and
 (Phase 3) real percentage-based token budget governance - see budget.py.
 
+(Phase 4) "mode" in model_map / hire() is now real: with a ModelPolicy
+attached (see policy.py), a rank or an individual employee can be routed
+automatically between local and API models, steered by an effort/priority
+hint that is accepted at hire time and per task.
+
 Deliberately NOT in this file yet (later phases, see the architecture doc /
 company-roadmap.md):
-  - the auto mode local-vs-API model policy layer (Phase 4) - for now every
-    rank's provider/model is explicit in model_map (or a per-employee
-    override at hire() time), "mode" is accepted but unused
   - skills/personality presets, default org templates, stub-and-fill delegation,
     and swappable color palettes for render_org_chart (Phase 5 - all four are
     meant to share one named-preset registry pattern, not be built separately)
@@ -100,12 +102,22 @@ class Employee:
         agent: Agent,
         reports_to: Optional["Employee"] = None,
         importance: float = 0.5,
+        effort: Optional[str] = None,
+        specialty: Optional[str] = None,
+        model_decision: Optional[Any] = None,
     ):
         self.name = name
         self.rank = rank
         self.agent = agent
         self.reports_to = reports_to
         self.importance = max(0.0, min(1.0, importance))
+        # Phase 4: the standing effort/priority hint for this employee, and the
+        # PolicyDecision (policy.py) that produced their current model - kept on
+        # the Employee so `why is Bob on gpt-4o-mini?` is answerable months later
+        # without re-deriving it. Both are None when no ModelPolicy is in play.
+        self.effort = effort
+        self.specialty = specialty
+        self.model_decision = model_decision
         self._subordinates: List["Employee"] = []
         if reports_to is not None:
             reports_to._subordinates.append(self)
@@ -223,14 +235,26 @@ class Company:
         emergency_budget_tokens: int = 0,
         rank_budget_shares: Optional[Dict[str, float]] = None,
         quota: Optional[ResourceQuota] = None,
+        model_policy: Optional[Any] = None,
     ):
         """
-        model_map: rank -> {"provider": ..., "model": ..., "api_key": ..., "mode": "local"|"api"|"auto"}.
-            "mode" is accepted but not acted on yet - Phase 4 wires it to
-            ModelRouter.allocate_local_auto()/benchmark.py for the local-vs-API
-            decision. Per-rank defaults here; hire() also takes a per-employee
+        model_map: rank -> {"provider": ..., "model": ..., "api_key": ...,
+            "mode": "local"|"api"|"auto", "effort": ..., "specialty": ...}.
+            Per-rank defaults; hire() also takes a per-employee
             provider/model/api_key override for when the ranking-style default
             isn't what a specific employee should use.
+            (Phase 4) "mode" is now acted on when a model_policy is attached:
+            "local"/"api"/"auto" are handed to ModelPolicy.decide(), which
+            consults benchmark.py/selector.py for the local side and its own
+            cost/specialty catalog for the API side. Without a model_policy,
+            "mode" is still inert and provider/model are taken literally, so
+            existing configs behave exactly as before.
+        model_policy: an optional policy.ModelPolicy. When present, any rank
+            or employee whose resolved mode is "local"/"api"/"auto" gets its
+            provider/model chosen by the policy instead of read from
+            model_map. An explicit provider+model (in model_map or at hire())
+            always wins over the policy - the policy fills gaps, it doesn't
+            override what you asked for.
         on_escalation: called once nothing automatic is left for EITHER
             escalation kind - the relevant reserve is empty, or a retry from
             it still failed. Must return an EscalationDecision.
@@ -264,6 +288,7 @@ class Company:
         self._emergency_budget_spent = 0
         self.budget = BudgetLedger(total_token_budget, rank_budget_shares)
         self.quota = quota
+        self.model_policy = model_policy
         self.teams: List[Team] = []
         self.employees: Dict[str, Employee] = {}
         self.activity_log: List[Dict[str, Any]] = []
@@ -279,6 +304,9 @@ class Company:
         model: Optional[str] = None,
         api_key: Optional[str] = None,
         importance: float = 0.5,
+        effort: Optional[str] = None,
+        specialty: Optional[str] = None,
+        mode: Optional[str] = None,
         **agent_kwargs: Any,
     ) -> Employee:
         """Builds an Agent for `rank` from model_map, wraps it as an Employee,
@@ -292,6 +320,23 @@ class Company:
         about hiring changes.
         importance: this employee's weight in BudgetLedger's percentage-based
         allocation (0.0-1.0, see budget.py) - defaults to a neutral 0.5.
+
+        (Phase 4) effort/specialty/mode steer the ModelPolicy, if this Company
+        has one:
+          effort:    "cheap" | "balanced" | "effort" (aliases like
+                     "needs effort" / "keep it cheap" are accepted). Falls
+                     back to model_map[rank]["effort"], then to the rank's
+                     default in policy.DEFAULT_RANK_EFFORT.
+          specialty: a tag matched against ApiModelSpec.specialties, e.g.
+                     "code" / "reasoning" / "vision".
+          mode:      "auto" | "local" | "api"; falls back to
+                     model_map[rank]["mode"]. Anything else (or no policy
+                     attached) means "take provider/model literally", which
+                     is the pre-Phase-4 behavior.
+
+        Note that effort deliberately does NOT change `importance` - see
+        policy.suggested_importance() for the explicit opt-in bridge and
+        policy.py's module docstring for why they stay separate knobs.
         """
         if name in self.employees:
             raise ValueError(f"'{name}' is already hired - names must be unique within a Company.")
@@ -299,14 +344,37 @@ class Company:
         if not rank_config:
             raise ValueError(f"No model_map entry for rank '{rank}' - add one before hiring for it.")
 
+        effort = effort if effort is not None else rank_config.get("effort")
+        specialty = specialty if specialty is not None else rank_config.get("specialty")
+
+        resolved_provider = provider or rank_config.get("provider", "ollama")
+        resolved_model = model or rank_config.get("model")
+        resolved_api_key = api_key or rank_config.get("api_key")
+        resolved_base_url = rank_config.get("base_url")
+        decision = self._decide_model(
+            rank=rank, effort=effort, specialty=specialty, mode=mode,
+            explicit_provider=provider or rank_config.get("provider"),
+            explicit_model=resolved_model,
+            employee_name=name,
+        )
+        if decision is not None and decision.ok:
+            resolved_provider = decision.provider or resolved_provider
+            resolved_model = decision.model or resolved_model
+            resolved_base_url = decision.base_url or resolved_base_url
+            resolved_api_key = resolved_api_key or decision.api_key
+
         agent = Agent(
-            provider=provider or rank_config.get("provider", "ollama"),
-            model=model or rank_config.get("model"),
-            api_key=api_key or rank_config.get("api_key"),
+            provider=resolved_provider,
+            model=resolved_model,
+            api_key=resolved_api_key,
+            base_url=resolved_base_url,
             system_instruction=system_instruction,
             **agent_kwargs,
         )
-        employee = Employee(name=name, rank=rank, agent=agent, reports_to=reports_to, importance=importance)
+        employee = Employee(
+            name=name, rank=rank, agent=agent, reports_to=reports_to, importance=importance,
+            effort=effort, specialty=specialty, model_decision=decision,
+        )
         if reports_to is not None:
             reports_to.agent.add_tool(employee.delegate_tool(company=self))
 
@@ -314,17 +382,136 @@ class Company:
         self._log("hire", employee=name, rank=rank, reports_to=(reports_to.name if reports_to else None))
         return employee
 
+    def _decide_model(
+        self,
+        rank: str,
+        effort: Optional[str],
+        specialty: Optional[str],
+        mode: Optional[str],
+        explicit_provider: Optional[str],
+        explicit_model: Optional[str],
+        employee_name: str,
+    ) -> Optional[Any]:
+        """Runs the ModelPolicy for one hire, if a policy is attached and the
+        resolved mode asks for one. Returns the PolicyDecision (which the
+        caller applies) or None to mean "no policy involvement, use the
+        literal model_map values".
+
+        An explicit provider AND model together are treated as "the user
+        already decided" and skip the policy entirely - the policy fills gaps
+        rather than overruling. A mode of "local"/"api"/"auto" with only one
+        of the two given still goes through the policy, since that config is
+        asking to be routed.
+
+        A policy that returns kind="unavailable" is logged and then ignored
+        (the literal model_map values are used) rather than raising: a routing
+        miss at hire time should be visible in the activity log, not fatal
+        halfway through building an org chart. It will surface again as a real
+        error on the first request, with the provider's own message.
+        """
+        if self.model_policy is None:
+            return None
+        rank_config = self.model_map.get(rank, {})
+        resolved_mode = (mode or rank_config.get("mode") or "").strip().lower()
+        if resolved_mode not in ("auto", "local", "api"):
+            return None
+        if explicit_provider and explicit_model:
+            return None
+
+        decision = self.model_policy.decide(
+            rank=rank, effort=effort, specialty=specialty, mode=resolved_mode,
+            requested_provider=explicit_provider, requested_model=explicit_model,
+        )
+        self._log(
+            "model_policy", employee=employee_name, rank=rank, mode=resolved_mode,
+            decision=decision.kind, effort=decision.effort,
+            provider=decision.provider, model=decision.model, reason=decision.reason,
+        )
+        return decision
+
+    def reassign_model(
+        self,
+        employee: Employee,
+        effort: Optional[str] = None,
+        specialty: Optional[str] = None,
+        mode: str = "auto",
+    ) -> Optional[Any]:
+        """Re-run the ModelPolicy for an already-hired employee and swap their
+        Agent onto the newly chosen model, in place.
+
+        This is what makes the effort hint *per-task* and not merely
+        per-employee: `Company.run(task, effort="needs effort")` calls this on
+        the entry point before starting. It uses `Agent.change_api()`, so the
+        employee keeps their conversation history, their registered tools
+        (including every delegate_to_* tool), and their usage counters - only
+        the endpoint changes. Returns the PolicyDecision, or None if this
+        company has no ModelPolicy.
+
+        Caveat worth stating plainly: switching provider mid-conversation
+        re-exports the existing history into the new provider's format
+        (Conversation.export_for handles that), but provider-native blocks
+        recorded from the old provider are replayed through the generic path.
+        For a fresh task on a fresh employee - the intended use - this is
+        clean; mid-conversation swaps on a long tool-heavy history are not
+        something this has been hardened for.
+        """
+        if self.model_policy is None:
+            return None
+        decision = self.model_policy.decide(
+            rank=employee.rank,
+            effort=effort if effort is not None else employee.effort,
+            specialty=specialty if specialty is not None else employee.specialty,
+            mode=mode,
+        )
+        self._log(
+            "model_policy", employee=employee.name, rank=employee.rank, mode=mode,
+            decision=decision.kind, effort=decision.effort,
+            provider=decision.provider, model=decision.model, reason=decision.reason,
+        )
+        if not decision.ok:
+            return decision
+        employee.model_decision = decision
+        if effort is not None:
+            employee.effort = effort
+        if specialty is not None:
+            employee.specialty = specialty
+        employee.agent.change_api(
+            provider=decision.provider or employee.agent.provider,
+            model=decision.model,
+            base_url=decision.base_url,
+            api_key=decision.api_key or employee.agent.api_key,
+        )
+        return decision
+
     def add_team(self, team: Team) -> None:
         self.teams.append(team)
         for member in team.members:
             self.employees.setdefault(member.name, member)
 
-    def run(self, task: str, entry_point: Optional[Employee] = None) -> str:
+    def run(
+        self,
+        task: str,
+        entry_point: Optional[Employee] = None,
+        effort: Optional[str] = None,
+        specialty: Optional[str] = None,
+    ) -> str:
         """Runs a task starting from entry_point, defaulting to the
-        highest-ranked employee registered (typically your C-suite)."""
+        highest-ranked employee registered (typically your C-suite).
+
+        (Phase 4) effort/specialty are the *per-task* form of the model
+        policy hint. When either is given and this Company has a ModelPolicy,
+        the entry point is re-routed for this task via reassign_model() before
+        it starts - so "this one is worth spending on" is a per-call argument,
+        not something baked in at hire time. The hint applies to the entry
+        point only; employees it delegates to keep their own standing hints,
+        since a manager deciding a task is hard doesn't mean every intern
+        touching it needs a frontier model.
+        """
         start = entry_point or self._default_entry_point()
         if start is None:
             raise ValueError("Company has no employees - call hire() before run().")
+        if (effort is not None or specialty is not None) and self.model_policy is not None:
+            self.reassign_model(start, effort=effort, specialty=specialty)
         self._log("task_start", employee=start.name, task=task[:200])
         result = start.run(task, company=self)
         self._log("task_end", employee=start.name)
