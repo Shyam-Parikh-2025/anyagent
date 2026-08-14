@@ -23,15 +23,14 @@ task through delegation.py's decomposition strategies.
 activity/tool-call logs after every completed top-level task - see
 compaction.py.
 
-Deliberately NOT in this file yet (later phases, see the architecture doc /
-company-roadmap.md):
-  - set_company_up() text/GUI company builder (Phase 8)
+(Phase 8) builder.set_company_up(mode="text"|"gui") builds a whole Company
+from a spec, a schema-driven tool call, or an interactive node-graph editor.
 
-This stays a single file for now (observability.py and budget.py split out
-already, same reasoning as hardware.py/router.py/compressor.py being separate
-concerns). Once Phase 4+ lands (model_policy.py, skills/, templates.py) this
-should become a company/ package - flagged here so that split isn't a
-surprise later.
+This is still a single file, and by now it should not be: budget.py,
+observability.py, policy.py, presets.py, delegation.py, compaction.py,
+builder.py and gui.py all orbit it. The company/ package split flagged here
+since Phase 0 is genuinely due - it was left alone through this run only
+because moving files mid-phase would have made every phase's diff unreadable.
 """
 
 import time

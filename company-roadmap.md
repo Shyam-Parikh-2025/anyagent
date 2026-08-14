@@ -384,21 +384,88 @@ them in the spec would let an AI-authored JSON blob name a provider and a key.
 The spec describes the org; the caller supplies the runtime. Every default
 taken is reported in `BuildResult.warnings` rather than applied silently.
 
+**Phase 8 (GUI mode) — the node-graph company editor** (`gui.py`, `gui_assets.py`)
+The half the roadmap called "meaningfully bigger than everything built so far
+combined", and it is: a small local web app, not a Python function.
+`http.server` serves one self-contained page plus a small JSON API, opened with
+`webbrowser.open()`. Vanilla JS and SVG — no framework, no CDN, no build step,
+so the zero-dependency rule holds on both sides of the wire.
+
+**The division of labour is the design.** The browser owns *interaction*
+(dragging, rubber-band and shift multi-select, the right-click bulk actions);
+Python owns *truth* (which preset names exist, whether a design is valid, what
+a template expands to). The page hardcodes no rank, skill, template or palette
+— it fetches them from Phase 5's registries at load, so adding a skill in
+`presets.py` makes it appear in the editor with no front-end change. A test
+asserts the JS contains none of those names.
+
+Implemented: click-to-connect (click the report, then the manager), shift-click
+and rubber-band multi-select, right-click bulk actions including "connect all N
+to one manager", "add a skill to all", duplicate and delete, a left panel for
+per-employee rank / manager / skills / personality / effort / policy mode /
+provider / model / importance, a left menu for templates, palettes and review
+settings, live validation against the server, auto-layout, and drag-to-move
+with positions persisted in `CompanySpec.layout` (which `build_company()`
+ignores entirely — it exists so reopening a design doesn't scramble the
+picture).
+
+Guards, none of them incidental:
+- The server binds **127.0.0.1 only** and every request must carry a random
+  per-session token issued at launch, so another local process — or a page in
+  another tab — can't drive the editor by guessing the port. Not an auth
+  system; the minimum that keeps an unauthenticated local port from being a
+  foot-gun.
+- **API keys are not editable and never enter a saved design**, and the page
+  says so where a user would look for the field. They come from the
+  `model_map` passed to `build_company()`, so a design file can be shared or
+  committed safely — the same rule text mode set.
+- Loading a template **expands it into concrete employees** rather than storing
+  a template reference: once nodes are dragged around, "this is the
+  small-coding-team template" stops being true, and a spec claiming a template
+  it no longer matches is worse than one that just lists its employees.
+- A build that fails validation **leaves the editor open** instead of returning
+  a broken company; only a successful build releases the waiting caller.
+- The GUI builds an org and **runs nothing** — identical to text mode, for
+  identical reasons.
+
+Testing, honestly split: `tests/test_gui.py` (30 checks, in the suite) drives
+every route over real HTTP and statically checks the page — one script block,
+no external loads, balanced structure, no hardcoded vocabulary, every fetch
+carrying the token, every called route actually served, user text escaped
+before insertion. `tests/browser_smoke.py` (**not** in the suite, and its
+filename deliberately doesn't match the runner's pattern) drives a headless
+Chromium through the DOM behaviour that genuinely can't be covered otherwise —
+template load, add, rename, drag, connect mode, the right-click menu, the
+cycle guard, check and build — failing on any console error. It needs
+playwright, which llmadapt does not depend on and shouldn't acquire for one
+module. It was run during this phase and passes with no console errors.
+
 ## Not built yet
 
-**Phase 8 — `set_company_up(mode="text"|"gui")` (new, this session)**
-Two builds under one name, different scope entirely:
+Nothing from the original Phase 0-8 plan remains. What's left is the
+deliberately-deferred work called out in the entries above:
 
-- *Text/schema mode*: **DONE** — see the Phase 8 entry in "Done" above.
-- *GUI mode*: a real interactive node-graph editor — click-to-connect
-  employees, multi-select + right-click bulk actions ("connect all to one
-  manager"), a left panel for per-employee model/API assignment, a left menu
-  for skill/team/color presets. This is not a Python function, it's a small
-  app: most likely a self-contained local web page (vanilla JS + SVG/canvas,
-  Python's `http.server` for a tiny local save/load API, opened via
-  `webbrowser.open()`) to stay in step with llmadapt's zero-dependency
-  ethos rather than pulling in a frontend framework. Meaningfully bigger than
-  everything built so far combined — its own phase, tackled last.
+- **Budget governance v2** — a real global water-filling optimizer instead of
+  Phase 3's fixed rank shares + ask-your-manager reallocation. Flagged since
+  Phase 3 as worth targeting once the simpler version has proven the escalation
+  path end to end. It has now run through five more phases without needing to
+  change, which is some evidence the simple version is load-bearing enough.
+- **Dynamic decomposition depth** (Phase 6's stretch goal) — deciding how far
+  to break a task down from the task itself, rather than fixing architect and
+  implementer tiers by rank. Still no clean formula; still research-adjacent.
+- **Verifying generated code** — Phase 6 checks assembled modules with
+  `compile()` for syntax only. Actually running or testing what the
+  implementers wrote is the obvious next increment, and the one that would
+  make stub-and-fill trustworthy rather than merely useful.
+- **Mid-generation budget enforcement** — Phase 3's gate is pre-flight, because
+  llmadapt cannot interrupt a request already in flight. Streaming responses
+  would make a real mid-response cutoff possible.
+- **A `company/` package split** — `company.py` has been carrying a note since
+  Phase 0 that it should become a package once enough neighbours landed. Six
+  modules now orbit it (`budget`, `observability`, `policy`, `presets`,
+  `delegation`, `compaction`, `builder`, `gui`), so the split is due; it was
+  left alone during this run because moving files mid-phase would have made
+  every phase's diff unreadable.
 
 ## Open questions
 

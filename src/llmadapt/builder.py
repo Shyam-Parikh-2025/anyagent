@@ -125,6 +125,11 @@ class CompanySpec:
     review_mode: str = "critique"
     max_review_rounds: int = 1
     notes: str = ""
+    # GUI-only: where gui.py's node-graph editor put each node, keyed by
+    # employee name. Carried in the spec so reopening a saved design doesn't
+    # scramble the picture, and ignored entirely by build_company() - it has
+    # no effect on the company that gets built.
+    layout: Dict[str, List[float]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "CompanySpec":
@@ -144,7 +149,7 @@ class CompanySpec:
             "emergency_budget_tokens": self.emergency_budget_tokens,
             "emergency_iteration_reserve": self.emergency_iteration_reserve,
             "review_mode": self.review_mode, "max_review_rounds": self.max_review_rounds,
-            "notes": self.notes,
+            "notes": self.notes, "layout": {k: list(v) for k, v in (self.layout or {}).items()},
         }
 
     def to_json(self, indent: int = 2) -> str:
