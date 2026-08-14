@@ -4,7 +4,7 @@ A small, provider-agnostic agent for chatting with LLMs and giving them
 tools. Works with Anthropic, OpenAI, Gemini, and Ollama using only the
 Python standard library for HTTP — no `requests`, no provider SDKs.
 
-v0.2.0
+v0.3.0
 
 ## Install
 
@@ -190,6 +190,122 @@ your routing/hardware logic:
 agent = Agent(provider="ollama", model="llama3.1:8b", is_local=True)
 ```
 
+## Multi-agent companies
+
+Beyond a single `Agent`, llmadapt can run a hierarchy of them — a `Company` of
+`Employee`s with reporting lines, delegation, budgets and oversight. Delegation
+is just the ordinary tool-calling loop: hiring someone with `reports_to=` puts a
+`delegate_to_<name>` tool on their manager's agent.
+
+```python
+from llmadapt import Company, RoleRank, EscalationDecision
+
+def on_escalation(event):
+    print(f"{event.employee_name} needs help: {event.message}")
+    return EscalationDecision(approve=True, extra_token_budget=5000)
+
+company = Company(
+    name="Acme",
+    model_map={
+        RoleRank.C_SUITE: {"provider": "anthropic", "model": "claude-3-5-sonnet-20241022"},
+        RoleRank.JUNIOR:  {"provider": "ollama",    "model": "llama3.1:8b"},
+    },
+    on_escalation=on_escalation,
+    total_token_budget=200_000,
+)
+
+boss = company.hire("Ada", RoleRank.C_SUITE)
+dev  = company.hire("Grace", RoleRank.JUNIOR, reports_to=boss, skills=["python"])
+
+print(company.run("Write a CSV parser"))
+print(company.render_org_chart(fmt="ascii"))
+print(company.budget_report())
+```
+
+**Budgets.** `total_token_budget` is a hard company-wide ceiling; nothing
+crosses it without `on_escalation` approving. Below it, each rank gets a
+percentage share scaled by a per-employee `importance`, and an employee who
+runs dry asks up the reporting chain before escalating. Emergency reserves
+default to `0`, meaning "always ask a human first". Note this is a *pre-flight*
+gate, not a mid-generation cutoff — llmadapt can't interrupt a request already
+in flight.
+
+**Local vs. API routing.** Attach a `ModelPolicy` and an effort hint decides
+where work runs: `cheap` keeps it on any local model that fits, `balanced`
+takes local only when it fits entirely in VRAM, `effort` goes to the API. The
+API model table is *your* config — the shipped defaults are hand-entered and
+will go stale.
+
+```python
+from llmadapt import ModelPolicy, ApiModelCatalog, ApiModelSpec
+
+policy = ModelPolicy(api_catalog=ApiModelCatalog([
+    ApiModelSpec(name="gpt-4o-mini", provider="openai",
+                 cost_per_1k_input=0.00015, cost_per_1k_output=0.0006,
+                 capability=0.55, specialties=("code",)),
+], include_defaults=False))
+
+company = Company(..., model_policy=policy)
+company.hire("Ada", RoleRank.SENIOR, mode="auto", effort="needs effort")
+company.run("something hard", effort="needs effort")   # per-task, too
+```
+
+**Presets.** Skills, personalities, org templates and org-chart palettes all
+come from one registry, so they work the same way and can all be extended:
+
+```python
+from llmadapt import SKILLS, ORG_TEMPLATES, Skill
+
+SKILLS.register(Skill(name="sql", instructions="Write portable ANSI SQL.",
+                      constraints=("Never use vendor-specific syntax.",)))
+
+team = company.build_from_template("small-coding-team", size="medium")
+print(company.render_org_chart(fmt="svg", palette="ocean"))
+```
+
+A `Team` with a `reviewer` actually reviews: the lead drafts, the reviewer
+signs off or sends it back (bounded by `max_review_rounds`, default 1), and an
+objection that survives the last round ships appended to the work rather than
+being dropped.
+
+**Task decomposition.** `run_structured()` offers two strategies beyond plain
+delegation:
+
+```python
+result = company.run_structured("build a JSON toolkit", strategy="stub_fill")
+print(result.code, result.unfilled)      # senior tier wrote the signatures,
+                                          # cheap tiers wrote the bodies
+result = company.run_structured("write a report", strategy="plan")
+print(result.answer, [s.instruction for s in result.steps])
+```
+
+Neither raises on a model-quality failure — an unfilled stub or a failed step
+comes back on the result object. Assembled code is checked with `compile()` for
+**syntax only**; nothing runs or tests it.
+
+**Log compaction.** `Company(log_compaction=LogCompactionPolicy(mode="algorithmic"))`
+collapses old activity and tool-call entries after each task, keeping counts
+and dropping specifics. Escalations, budget decisions and errors are never
+compacted away.
+
+**Building a company.** Either from code, from an AI tool call, or by hand:
+
+```python
+from llmadapt import set_company_up, register_company_builder
+
+# for an AI caller - the schema is generated from the function's own hints
+register_company_builder(my_agent)
+
+# for a human - opens an interactive node-graph editor in the browser
+result = set_company_up(mode="gui", model_map=my_model_map)
+company = result.company
+```
+
+Both modes build the org and **run nothing** — starting work stays your
+explicit step. With no `model_map`, everything defaults to local Ollama so an
+unconfigured build cannot spend money; with no `on_escalation`, the default
+handler declines.
+
 ## Supported providers
 
 | provider    | env var for API key   | notes                          |
@@ -203,12 +319,16 @@ agent = Agent(provider="ollama", model="llama3.1:8b", is_local=True)
 ## Running tests
 
 ```bash
-python tests/test_agent.py
-python tests/test_full.py
+PYTHONPATH=src python3 tests/run_all.py     # the whole suite
+PYTHONPATH=src python3 tests/test_agent.py  # or one file
 ```
 
 Tests run entirely offline against scripted fake HTTP responses — no API key
-or network access required.
+or network access required. Plain `assert` + `print`, no test framework.
+
+`tests/browser_smoke.py` is deliberately outside the suite: it drives the
+Phase 8 GUI through a real headless browser and needs `playwright`, which
+llmadapt does not depend on. Run it by hand after changing `gui_assets.py`.
 
 ## License
 

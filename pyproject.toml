@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmadapt"
-version = "0.2.0"
+version = "0.3.0"
 description = "A lightweight, provider-agnostic LLM agent with tool-calling, context compression, rank-based routing, and hardware-aware local model support for Anthropic, OpenAI, Gemini, and Ollama."
 readme = "README.md"
 requires-python = ">=3.9"

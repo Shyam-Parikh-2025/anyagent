@@ -77,4 +77,4 @@ __all__ = [
     "company_options",
     "register_company_builder",
 ]
-__version__ = "0.2.0"
+__version__ = "0.3.0"
