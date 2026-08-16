@@ -10,7 +10,10 @@ import json
 from types import SimpleNamespace
 
 from llmadapt.core import Agent
-from llmadapt.budget import DEFAULT_RANK_BUDGET_SHARES, normalize_shares, BudgetLedger
+from llmadapt.budget import (
+    DEFAULT_RANK_BUDGET_SHARES, BudgetLedger, CostModel, normalize_shares,
+)
+from llmadapt.policy import ApiModelCatalog, ApiModelSpec
 from llmadapt.company import Company, EscalationDecision, EscalationUnresolved
 from llmadapt.router import RoleRank
 
@@ -269,5 +272,119 @@ assert report["emergency_budget_tokens"] == 20
 assert report["emergency_budget_spent"] == 0
 assert report["employees"]["Manager1"]["spent"] == 30
 print("PASS: budget_report() reflects company-wide and per-employee allocation/spend state")
+
+# ---------------------------------------------------------------------------
+# Cost weighting: not all tokens are equal
+# ---------------------------------------------------------------------------
+# An intern on local Ollama and a C-suite on a frontier API model both spend
+# "tokens"; charging them at the same rate made a mixed company's budget mean
+# nothing. Opt-in, so every test above still measures raw tokens.
+
+COST_CATALOG = ApiModelCatalog([
+    ApiModelSpec(name="big", provider="anthropic", cost_per_1k_input=0.003,
+                 cost_per_1k_output=0.015, capability=0.95),
+    ApiModelSpec(name="small", provider="openai", cost_per_1k_input=0.00015,
+                 cost_per_1k_output=0.0006, capability=0.55),
+])
+COST_MAP = {
+    RoleRank.C_SUITE: {"provider": "anthropic", "model": "big", "api_key": "k"},
+    RoleRank.INTERN: {"provider": "ollama", "model": "llama3",
+                      "base_url": "http://localhost:11434"},
+    RoleRank.JUNIOR: {"provider": "openai", "model": "small", "api_key": "k"},
+    RoleRank.SENIOR: {"provider": "mystery-vendor", "model": "unlisted", "api_key": "k"},
+}
+
+
+def cost_company(**kwargs):
+    return Company(name="Cost Co", model_map=COST_MAP,
+                   on_escalation=lambda e: EscalationDecision(approve=False),
+                   total_token_budget=100_000, cost_weighted_budget=True,
+                   cost_model=CostModel(api_catalog=COST_CATALOG, model_map=COST_MAP),
+                   **kwargs)
+
+
+cost_co = cost_company()
+boss = cost_co.hire("Boss", RoleRank.C_SUITE)
+intern = cost_co.hire("Intern", RoleRank.INTERN)
+mid = cost_co.hire("Mid", RoleRank.JUNIOR)
+unknown = cost_co.hire("Unknown", RoleRank.SENIOR)
+for employee in (boss, intern, mid, unknown):
+    employee.agent.total_tokens_used = 10_000
+
+assert cost_co.budget.charged_spend(intern) == 0, "local tokens are free"
+assert cost_co.budget.charged_spend(boss) > 10_000, "a frontier model costs more than baseline"
+assert cost_co.budget.charged_spend(mid) < 10_000, "a cheap model costs less than baseline"
+assert cost_co.budget.charged_spend(unknown) == 10_000, "an unknown model falls back to 1.0"
+print("PASS: cost weighting charges local, frontier, cheap and unknown models differently")
+
+assert cost_co.total_raw_tokens_spent() == 40_000
+assert cost_co.total_tokens_spent() != 40_000
+report = cost_co.budget_report()
+assert report["cost_weighted"] is True
+assert report["total_raw_tokens"] == 40_000
+assert report["employees"]["Boss"]["raw_tokens"] == 10_000
+assert "baseline" in report["employees"]["Boss"]["cost_basis"]
+assert "locally" in report["employees"]["Intern"]["cost_basis"]
+print("PASS: budget_report carries the raw count and the reason beside the charged figure")
+
+# The failure direction matters: an unknown model must not be assumed free.
+assert CostModel().weight_for(unknown) == 1.0
+print("PASS: with no catalog at all, an unpriced employee still weighs 1.0, not 0.0")
+
+# The model_map path, for a company that pins providers by hand and never
+# attaches a ModelPolicy - cost weighting must not require Phase 4.
+hand_map = {RoleRank.SENIOR: {"provider": "mystery-vendor", "model": "unlisted",
+                              "api_key": "k", "cost_per_1k": 0.02}}
+hand_co = Company(name="Hand Co", model_map=hand_map,
+                  on_escalation=lambda e: EscalationDecision(approve=False),
+                  total_token_budget=100_000,
+                  cost_model=CostModel(baseline_per_1k=0.004, model_map=hand_map))
+hand = hand_co.hire("Hand", RoleRank.SENIOR)
+hand.agent.total_tokens_used = 1_000
+assert hand_co.budget.charged_spend(hand) == 5_000, hand_co.budget.charged_spend(hand)
+assert "model_map" in hand_co.budget.cost_model.explain(hand)
+print("PASS: model_map[rank]['cost_per_1k'] works with no ModelPolicy attached")
+
+# An explicit per-employee override beats every derived price.
+override = hand_co.hire("Override", RoleRank.SENIOR, cost_weight=0.5)
+override.agent.total_tokens_used = 1_000
+assert hand_co.budget.charged_spend(override) == 500
+print("PASS: hire(cost_weight=) overrides the derived price")
+
+# Off by default: the ledger stays in raw tokens unless asked.
+plain_co = Company(name="Plain Co", model_map=COST_MAP,
+                   on_escalation=lambda e: EscalationDecision(approve=False),
+                   total_token_budget=100_000)
+plain_boss = plain_co.hire("Boss", RoleRank.C_SUITE)
+plain_boss.agent.total_tokens_used = 10_000
+assert plain_co.budget.cost_model is None
+assert plain_co.total_tokens_spent() == 10_000
+assert "raw_tokens" not in plain_co.budget_report()["employees"]["Boss"]
+print("PASS: cost weighting is off by default and the old numbers are unchanged")
+
+# The weighted figure is what the gate actually enforces. Checked at the gate
+# rather than through run(), so the assertion is about budgeting and not about
+# which provider's response shape the FakeResponder is imitating.
+tight = Company(name="Tight Co", model_map=COST_MAP,
+                on_escalation=lambda e: EscalationDecision(approve=False),
+                total_token_budget=20_000, cost_weighted_budget=True,
+                cost_model=CostModel(api_catalog=COST_CATALOG, model_map=COST_MAP))
+free_worker = tight.hire("FreeWorker", RoleRank.INTERN)
+paid_worker = tight.hire("PaidWorker", RoleRank.C_SUITE)
+free_worker.agent.total_tokens_used = 500_000  # far past the ceiling, in raw tokens
+assert tight.total_raw_tokens_spent() == 500_000
+assert tight.total_tokens_spent() == 0, "none of it counts - it was all free"
+assert tight._budget_gate(free_worker, "a task") is None, \
+    "a local employee should never be stopped by a ceiling its tokens do not count against"
+
+paid_worker.agent.total_tokens_used = 20_000  # weighs > 1x, so this crosses the ceiling
+assert tight.total_tokens_spent() > 20_000
+try:
+    tight._budget_gate(paid_worker, "a task")
+    assert False, "expected the hard ceiling to escalate"
+except EscalationUnresolved as e:
+    assert e.event.detail == "hard_ceiling"
+print("PASS: the hard ceiling is enforced on charged spend, so free local work is not blocked")
+
 
 print("\nAll checks passed.")

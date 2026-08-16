@@ -14,10 +14,17 @@ in RoleRank.ORDER, validated for colorblind-safe adjacent contrast. Per that
 skill's non-negotiable rule ("text wears text tokens, never the series
 color"), node text is always drawn in ink tokens - the rank color only ever
 appears on the node's border, never behind or as the text itself.
+
+(Phase 5) Those colors now live in presets.py as the "dataviz" Palette in the
+shared PALETTES registry, and every renderer takes palette=<name or Palette>.
+That was an explicit design correction: palettes are picked by name through
+the *same* mechanism as skills, personalities, and org templates - not a
+bespoke colour system bolted onto this module. This file keeps only the
+default-resolution helper; the colours themselves are presets.
 """
 
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 class EventLog:
@@ -59,13 +66,21 @@ def record_tool_call(
     result: Any,
     duration_s: float,
     error: Optional[str] = None,
+    archive: Optional[Any] = None,
 ) -> None:
     """Appends one entry to a tool-call log (e.g. Company.tool_call_log).
     Kept as a free function rather than a class - the log itself is just a
     list, callers append their own shaped entries too if they want; this is
-    the shape delegation calls use."""
+    the shape delegation calls use.
+
+    `archive` is an optional archive.RunArchive written through at the same
+    moment, so the archived record predates any Phase 7 compaction of `log`.
+    The archived copy carries the **full** result rather than the 200-char
+    preview: the preview exists to keep the in-memory log small, which is
+    exactly the constraint a file on disk does not have, and "what did that
+    tool actually return?" is a main reason to keep an archive at all."""
     result_str = result if isinstance(result, str) else str(result)
-    log.append({
+    entry = {
         "time": time.time(),
         "employee": employee,
         "tool_name": tool_name,
@@ -73,21 +88,15 @@ def record_tool_call(
         "result_preview": result_str[:200],
         "duration_s": round(duration_s, 4),
         "error": error,
-    })
+    }
+    log.append(entry)
+    if archive is not None:
+        archive.append("tool_call", dict(entry, result=result_str))
 
 
 # ---- org chart rendering ---------------------------------------------------
 
-# Fixed-order categorical palette (dataviz skill's references/palette.md,
-# July-2026 default order) - one hue per rank tier, assigned in RoleRank.ORDER
-# and never re-cycled or re-ordered per-chart, per that skill's categorical
-# assignment rule.
-_RANK_COLORS_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7"]
-_RANK_COLORS_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9"]
-_SURFACE = {"light": "#fcfcfb", "dark": "#1a1a19"}
-_INK_PRIMARY = {"light": "#0b0b0b", "dark": "#ffffff"}
-_INK_SECONDARY = {"light": "#52514e", "dark": "#c3c2b7"}
-_CONNECTOR = {"light": "#c3c2b7", "dark": "#383835"}
+DEFAULT_PALETTE = "dataviz"
 
 _NODE_W = 160
 _NODE_H = 50
@@ -96,15 +105,23 @@ _V_GAP = 60
 _TOP_MARGIN = 40
 
 
-def _rank_color(rank: str, theme: str) -> str:
-    from .router import RoleRank
+def resolve_palette(palette=None, registry=None):
+    """Turns a palette name (or a Palette object, or None) into a Palette.
 
-    colors = _RANK_COLORS_DARK if theme == "dark" else _RANK_COLORS_LIGHT
-    try:
-        idx = RoleRank.ORDER.index(rank)
-    except ValueError:
-        idx = len(colors) - 1  # unrecognized rank - fall back to the last slot rather than crash
-    return colors[idx % len(colors)]
+    None means the "dataviz" default, which is the palette this module used
+    exclusively before Phase 5 - so every existing render_org_chart() call
+    produces byte-identical output to what it produced before.
+    """
+    from .presets import PALETTES, Palette
+
+    if isinstance(palette, Palette):
+        return palette
+    registry = registry or PALETTES
+    return registry.get(palette or DEFAULT_PALETTE)
+
+
+def _rank_color(rank: str, theme: str, palette=None) -> str:
+    return resolve_palette(palette).color_for_rank(rank, theme)
 
 
 def _escape(s: Any) -> str:
@@ -136,9 +153,13 @@ def _safe_mermaid_id(name: str) -> str:
     return "n_" + "".join(c if c.isalnum() else "_" for c in name)
 
 
-def render_org_chart_mermaid(chart: Dict[str, Any], theme: str = "light") -> str:
+def render_org_chart_mermaid(chart: Dict[str, Any], theme: str = "light", palette=None) -> str:
     """Mermaid `graph TD` text - pastes directly into a GitHub/GitLab markdown
-    file or any Mermaid-aware renderer, no image generation required."""
+    file or any Mermaid-aware renderer, no image generation required.
+
+    palette: a name from the shared PALETTES registry (presets.py) or a
+    Palette object; None means the "dataviz" default."""
+    pal = resolve_palette(palette)
     lines = ["graph TD"]
     seen_ranks: List[str] = []
 
@@ -158,10 +179,10 @@ def render_org_chart_mermaid(chart: Dict[str, Any], theme: str = "light") -> str
         walk(root)
 
     for rank in seen_ranks:
-        color = _rank_color(rank, theme)
+        color = pal.color_for_rank(rank, theme)
         lines.append(
             f"    classDef {_class_name(rank)} stroke:{color},stroke-width:2px,"
-            f"fill:{_SURFACE[theme]},color:{_INK_PRIMARY[theme]}"
+            f"fill:{pal.surface[theme]},color:{pal.ink_primary[theme]}"
         )
     return "\n".join(lines)
 
@@ -193,16 +214,20 @@ def _layout(nodes: List[Dict[str, Any]], depth: int, x_offset: float, positions:
     return cursor - x_offset
 
 
-def render_org_chart_svg(chart: Dict[str, Any], theme: str = "light") -> str:
+def render_org_chart_svg(chart: Dict[str, Any], theme: str = "light", palette=None) -> str:
     """A self-contained SVG tree diagram - no JS, no external renderer, opens
     directly in any browser or image viewer. Pure-Python tree layout (no
     graphviz/matplotlib dependency), matching llmadapt's zero-dependency
-    design."""
+    design.
+
+    palette: a name from the shared PALETTES registry (presets.py) or a
+    Palette object; None means the "dataviz" default."""
     roots = chart.get("org", [])
-    surface = _SURFACE[theme]
-    ink_primary = _INK_PRIMARY[theme]
-    ink_secondary = _INK_SECONDARY[theme]
-    connector = _CONNECTOR[theme]
+    pal = resolve_palette(palette)
+    surface = pal.surface[theme]
+    ink_primary = pal.ink_primary[theme]
+    ink_secondary = pal.ink_secondary[theme]
+    connector = pal.connector[theme]
     company_name = _escape(chart.get("company", "Company"))
 
     if not roots:
@@ -247,7 +272,7 @@ def render_org_chart_svg(chart: Dict[str, Any], theme: str = "light") -> str:
         for node in nodes:
             p = positions[id(node)]
             x, y = p["x"] - _NODE_W / 2, p["y"] + _TOP_MARGIN
-            color = _rank_color(node["rank"], theme)
+            color = pal.color_for_rank(node["rank"], theme)
             parts.append(
                 f'<rect x="{x:.1f}" y="{y:.1f}" width="{_NODE_W}" height="{_NODE_H}" rx="8" '
                 f'fill="{surface}" stroke="{color}" stroke-width="2"/>'

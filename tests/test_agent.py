@@ -143,4 +143,46 @@ exported = agent.tool_registry.export_for("anthropic")
 assert len(exported) == 1
 print("PASS: schemas is a dict; duplicate registration overwrites instead of duplicating")
 
+# Test 7: tokens_used()/tokens_left()/set_max_context_tokens()
+agent = make_agent()
+assert agent.max_context_tokens is None
+assert agent.tokens_left() is None, "no budget set - nothing to count down from"
+baseline = agent.tokens_used()
+assert baseline >= 0
+
+agent.add_tool(get_weather)
+with_tool = agent.tokens_used()
+assert with_tool > baseline, "a registered tool's schema should count toward tokens_used()"
+
+agent.conversation.add_user_msg("A reasonably long message to make sure history is counted too.")
+with_history = agent.tokens_used()
+assert with_history > with_tool, "conversation history should count toward tokens_used()"
+
+agent.set_max_context_tokens(1000)
+assert agent.max_context_tokens == 1000
+assert agent.tokens_left() == 1000 - agent.tokens_used()
+
+# Floors at 0 rather than going negative once usage exceeds the budget.
+agent.set_max_context_tokens(1)
+assert agent.tokens_left() == 0
+
+# None clears the budget again.
+agent.set_max_context_tokens(None)
+assert agent.tokens_left() is None
+print("PASS: tokens_used()/tokens_left() track system instruction, tools and history; "
+      "set_max_context_tokens() sets and clears the budget")
+
+try:
+    agent.set_max_context_tokens(-1)
+    assert False, "should have raised"
+except ValueError:
+    print("PASS: set_max_context_tokens rejects a negative budget")
+
+# The constructor argument documented in the README does the same thing as
+# calling set_max_context_tokens() after the fact.
+agent2 = Agent(provider="anthropic", model="claude-x", api_key="test-key", max_context_tokens=500)
+assert agent2.max_context_tokens == 500
+assert agent2.tokens_left() == 500 - agent2.tokens_used()
+print("PASS: Agent(max_context_tokens=...) sets the budget at construction time")
+
 print("\nAll checks passed.")

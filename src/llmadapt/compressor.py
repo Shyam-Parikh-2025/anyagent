@@ -4,11 +4,24 @@ import itertools
 import logging
 import re
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 _TOKEN_CHUNK = re.compile(r"[A-Za-z0-9]+|\s+|[^\sA-Za-z0-9]")
+
+# The key a message carries to mark itself exempt from history compaction.
+#
+# It lives here rather than in core.py because the direction of the import is
+# core -> compressor, and the policy that has to *honour* the mark is here.
+# core.Conversation re-exposes it as Conversation.PIN_KEY so a caller never has
+# to know which module owns the constant.
+#
+# Leading underscore on purpose: Conversation.export_for() strips every
+# "_"-prefixed key before a message is sent (the convention _native and
+# _native_provider already use), so a pin is bookkeeping this library can see
+# and no provider ever will.
+PIN_KEY = "_pinned"
 
 
 class ContextCompressor:
@@ -232,7 +245,21 @@ class ContextCompressor:
         unit = "tokens" if use_tokens else "characters"
         total = ContextCompressor._token_len(output) if use_tokens else len(output)
 
-        if budget <= 0:  # TODO decide if we want to raise an exception or just return the original output or nothing
+        if budget <= 0:
+            # A non-positive budget means "no room at all", so the whole output
+            # is dropped and only the marker survives. Deliberately not the
+            # other two candidates: raising would take down a live run over a
+            # config slip in a *truncation utility*, and returning the original
+            # would blow through exactly the budget the caller asked to be held
+            # to - the one thing this function exists to guarantee. But it is
+            # almost always a misconfiguration rather than an intent, and
+            # silently discarding a tool result is expensive to debug from the
+            # far end, so say so.
+            logger.warning(
+                "compress_tool_output: budget is %d %s (<= 0), so the entire %d-%s output was "
+                "dropped and replaced by a marker - check the CompressionPolicy that produced it",
+                budget, unit, total, unit,
+            )
             return f"... [Truncated {total} {unit}] ..."
 
         if total <= budget:
@@ -551,6 +578,15 @@ class HistoryCompactionPolicy:
     either. Falls back to "algorithmic" automatically if the summarizer fails or isn't set, so
     setting mode="agent" is never a way to break a run, only to try to improve it.
 
+    **Pinned messages are never compacted**, at any mode and any age - the
+    conversation-side twin of compaction.ALWAYS_KEEP_KINDS. Before pins existed
+    the only protected thing was a leading system message, which covers an
+    employee's identity and nothing else, so a spec agreed at turn 3 or a
+    correction the model needed twice was fair game the moment the conversation
+    grew. Mark one with Conversation.pin()/pin_last() and it passes through in
+    place. The rule for what deserves it is the same one ALWAYS_KEEP_KINDS uses:
+    if losing it would change the answers, it stays.
+
     Fields:
         mode                   "off" | "algorithmic" | "agent". Anything other than "agent" is
                               treated as algorithmic once compaction actually triggers - so a
@@ -620,16 +656,35 @@ class HistoryCompactionPolicy:
         old_groups = groups[:-self.keep_recent_rounds]
         recent_groups = groups[-self.keep_recent_rounds:]
 
-        if self.mode == "agent":
-            if self.summarizer is None:
-                logger.warning("HistoryCompactionPolicy: mode='agent' but no summarizer set - "
-                                "falling back to algorithmic compaction")
-                compacted = ContextCompressor._compact_algorithmic(old_groups, self.algorithmic_result_chars)
+        def compact_run(run: list) -> list:
+            """Compact one run of consecutive unpinned groups."""
+            if not run:
+                return []
+            if self.mode == "agent":
+                if self.summarizer is None:
+                    logger.warning("HistoryCompactionPolicy: mode='agent' but no summarizer set - "
+                                    "falling back to algorithmic compaction")
+                    return ContextCompressor._compact_algorithmic(run, self.algorithmic_result_chars)
+                return ContextCompressor._compact_with_summarizer(
+                    run, self.summarizer, self.summary_budget_chars, self.algorithmic_result_chars)
+            return ContextCompressor._compact_algorithmic(run, self.algorithmic_result_chars)
+
+        # Pinned groups pass through untouched, in place. Walking the old groups
+        # and flushing runs around each pin - rather than compacting them all and
+        # re-inserting the pins afterwards - is what keeps the result in
+        # chronological order. A history where a pinned turn from step 2 appears
+        # after a digest covering steps 1-9 reads as though it happened later,
+        # and the model has no way to tell that it didn't.
+        compacted: List[Dict[str, Any]] = []
+        run: List[list] = []
+        for group in old_groups:
+            if any(msg.get(PIN_KEY) for msg in group):
+                compacted.extend(compact_run(run))
+                run = []
+                compacted.extend(group)
             else:
-                compacted = ContextCompressor._compact_with_summarizer(
-                    old_groups, self.summarizer, self.summary_budget_chars, self.algorithmic_result_chars)
-        else:
-            compacted = ContextCompressor._compact_algorithmic(old_groups, self.algorithmic_result_chars)
+                run.append(group)
+        compacted.extend(compact_run(run))
 
         recent_msgs = [msg for group in recent_groups for msg in group]
         result = compacted + recent_msgs
@@ -673,15 +728,22 @@ SUPPORTED_MODELS = [f"model-{i}" for i in range(50)]
 
     print("\n--- HistoryCompactionPolicy demo ---")
 
-    def make_fake_history(n_rounds):
+    def make_fake_history(n_rounds: int) -> List[Dict[str, Any]]:
         """Builds a synthetic Conversation.history-shaped list: a system message, then
         n_rounds of (user question -> assistant tool call -> tool result), ending on a plain
-        assistant text reply - same dict shape core.py actually produces."""
-        h = [{"role": "system", "content": "You are a build assistant."}]
+        assistant text reply - same dict shape core.py actually produces.
+
+        The annotation is what removes the `# type: ignore` that used to sit on the assistant
+        turn below. A bare `h = [{...}]` is inferred as Dict[str, str] from the first element,
+        so appending a message whose `content` is None (which is exactly what an assistant
+        tool-call turn looks like on the wire) then reads as a type error. Declaring the real
+        shape up front is the honest fix; silencing the checker was hiding a correct warning
+        about an inference that was too narrow."""
+        h: List[Dict[str, Any]] = [{"role": "system", "content": "You are a build assistant."}]
         for i in range(n_rounds):
             h.append({"role": "user", "content": f"Please check on task {i}."})
-            h.append({ "role": "assistant", "content": None, # type: ignore 
-                      "tool_calls": [{"function": {"name": "run_tests", # TODO remove type ignore properly
+            h.append({"role": "assistant", "content": None,
+                      "tool_calls": [{"function": {"name": "run_tests",
                                      "arguments": {"suite": f"suite_{i}"}}}]})
             h.append({"role": "tool", "name": "run_tests",
                       "content": f"Running suite_{i}...\n" + "PASS test_case\n" * 30 + "2 failures found."})

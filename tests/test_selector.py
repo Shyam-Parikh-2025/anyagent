@@ -9,7 +9,7 @@ import time
 from llmadapt.benchmark import BenchmarkResult
 from llmadapt.hardware import ResourceQuota
 from llmadapt.router import ModelRouter
-from llmadapt.selector import LocalModelCandidate, ModelCatalog, LocalModelSelector
+from llmadapt.selector import ModelCatalog, LocalModelSelector
 
 
 def make_benchmark(gpu_vram_gb, system_ram_gb, cpu_gflops=100.0, pcie_bandwidth_gbps=8.0, gpu_tflops=20.0):

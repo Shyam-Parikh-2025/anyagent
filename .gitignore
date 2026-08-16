@@ -7,3 +7,8 @@ build/
 venv/
 .pytest_cache/
 *.env
+
+# A git bundle of this repo, produced for hand-off. Deliberately not tracked:
+# committing a snapshot of the repo into the repo is self-referential and goes
+# stale on the very next commit. It is delivered as a file, not as history.
+llmadapt-overnight.bundle
