@@ -16,6 +16,7 @@ from llmadapt.delegation import (
     assemble_module,
     choose_architect,
     choose_implementers,
+    _implementation_for,
     extract_code_block,
     extract_stubs,
     parse_plan_steps,
@@ -371,5 +372,83 @@ try:
 except ValueError as e:
     assert "telepathy" in str(e)
 print("PASS 28: an unknown strategy raises a clear ValueError")
+
+# ---------------------------------------------------------------------------
+# Decorators, and the architect's one-line shortcut
+# ---------------------------------------------------------------------------
+# Both of these guard the same failure: code that compiles and is wrong. A
+# dropped decorator changes behaviour without changing whether anything parses,
+# and an architect that "just does it" past the one-line allowance writes the
+# implementation nobody reviews.
+
+DECORATED = block(
+    "import functools\n\n"
+    "@functools.lru_cache(maxsize=8)\n"
+    "def compute(x: int) -> int:\n"
+    '    """Return x doubled."""\n'
+    "    ...\n"
+)
+
+plan = extract_stubs(DECORATED)
+assert plan.stubs[0].source.startswith("@functools.lru_cache(maxsize=8)"), plan.stubs[0].source
+assert plan.stubs[0].decorators == ("functools.lru_cache(maxsize=8)",)
+print("PASS 29: a decorated stub keeps its decorator in the stub source and records it")
+
+kept = _implementation_for(plan.stubs[0], block(
+    "@functools.lru_cache(maxsize=8)\n"
+    "def compute(x: int) -> int:\n"
+    "    return x * 2\n"))
+assert kept.ok and kept.implementation.startswith("@functools.lru_cache"), kept.implementation
+assembled = assemble_module(plan, [kept])
+assert "@functools.lru_cache(maxsize=8)" in assembled, assembled
+print("PASS 30: the decorator survives the implementer round-trip into the assembled module")
+
+dropped = _implementation_for(plan.stubs[0], block(
+    "def compute(x: int) -> int:\n"
+    "    return x * 2\n"))
+assert not dropped.ok and "decorator" in (dropped.error or ""), dropped.error
+changed = _implementation_for(plan.stubs[0], block(
+    "@staticmethod\n"
+    "def compute(x: int) -> int:\n"
+    "    return x * 2\n"))
+assert not changed.ok and "decorator" in (changed.error or ""), changed.error
+print("PASS 31: an implementer that drops or swaps a decorator is unfilled, not silently accepted")
+
+SHORTCUT = block(
+    "def tiny(x): return x + 1\n\n"
+    "def sneaky(a, b):\n"
+    "    total = a + b\n"
+    "    total *= 2\n"
+    "    return total\n\n"
+    "def helper(x):\n"
+    '    """A deliberate helper."""\n'
+    "    return x - 1\n"
+)
+plan2 = extract_stubs(SHORTCUT)
+assert plan2.architect_implemented == ["tiny"], plan2.architect_implemented
+assert plan2.demoted == ["sneaky"], plan2.demoted
+assert "def helper" in plan2.preamble and "def tiny" in plan2.preamble
+assert "def sneaky" not in plan2.preamble
+print("PASS 32: a one-line body is allowed and recorded; a longer one is demoted back to a stub")
+
+assert plan2.stubs[0].source.strip().endswith("..."), plan2.stubs[0].source
+assert "the one-line shortcut allows at most" in plan2.stubs[0].demoted_reason
+print("PASS 33: a demoted function is stripped to a real stub and says why it was demoted")
+
+plan3 = extract_stubs(SHORTCUT, max_architect_body_lines=5)
+assert plan3.demoted == [] and sorted(plan3.architect_implemented) == ["sneaky", "tiny"]
+print("PASS 34: max_architect_body_lines moves the line, and a documented helper is never demoted")
+
+company13, arch13, i13a, i13b = build_stub_company()
+arch13.agent._send_request = FakeResponder([text_response(SHORTCUT)])
+i13a.agent._send_request = FakeResponder([text_response(block(
+    "def sneaky(a, b):\n    return (a + b) * 2\n"))])
+res13 = stub_and_fill(company13, "t", architect=arch13, implementers=[i13a])
+done = [e for e in company13.activity() if e["kind"] == "stub_architect_done"][0]
+assert done["architect_implemented"] == ["tiny"] and done["demoted"] == ["sneaky"]
+assert res13.architect_implemented == ["tiny"]
+assert res13.to_dict()["demoted"] == ["sneaky"]
+print("PASS 35: stub_and_fill logs architect-written code and surfaces it on the result")
+
 
 print("\nAll Phase 6 delegation checks passed.")

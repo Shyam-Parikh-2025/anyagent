@@ -24,6 +24,7 @@ from llmadapt.policy import (
     normalize_effort,
     suggested_importance,
 )
+from llmadapt.presets import SKILLS
 from llmadapt.router import RoleRank
 from llmadapt.selector import LocalModelCandidate, ModelCatalog
 
@@ -396,5 +397,75 @@ assert survivor.model_decision.kind == "unavailable"
 assert survivor.agent.provider == "anthropic"  # fell back to the model_map values
 assert any(e["decision"] == "unavailable" for e in dead_co.activity().by_kind("model_policy"))
 print("PASS 34: an unroutable policy decision is logged and falls back, not fatal at hire time")
+
+# ---------------------------------------------------------------------------
+# Typo handling, and the company-wide default routing mode
+# ---------------------------------------------------------------------------
+# An unrecognized effort hint still falls back rather than raising (Phase 4's
+# decision - this value comes from an LLM filling a schema), but it no longer
+# does so silently: a one-character typo used to quietly return the LOWEST
+# tier with nothing anywhere saying why.
+
+typo_policy = ModelPolicy(api_catalog=api_catalog())
+resolved, note = typo_policy.resolve_effort_explained("balnced", RoleRank.JUNIOR)
+assert resolved == DEFAULT_RANK_EFFORT[RoleRank.JUNIOR], resolved
+assert "not recognized" in note and "'balanced'" in note, note
+clean, clean_note = typo_policy.resolve_effort_explained("balanced", RoleRank.JUNIOR)
+assert clean == EFFORT_BALANCED and clean_note == ""
+print("PASS 35: an unrecognized effort still falls back, but says so and suggests the real name")
+
+typo_decision = typo_policy.decide(rank=RoleRank.JUNIOR, effort="balnced")
+assert "not recognized" in typo_decision.reason, typo_decision.reason
+assert typo_decision.effort == DEFAULT_RANK_EFFORT[RoleRank.JUNIOR]
+assert "not recognized" not in typo_policy.decide(rank=RoleRank.JUNIOR, effort="cheap").reason
+print("PASS 36: the note reaches PolicyDecision.reason, so the log explains the model choice")
+
+try:
+    SKILLS.get("pyhton")
+    assert False, "expected a KeyError"
+except KeyError as e:
+    assert "did you mean 'python'?" in str(e), str(e)
+print("PASS 37: a misspelled preset name suggests the nearest real one too")
+
+# default_policy_mode: what was missing was saying "this company is local" once.
+# A rank whose model_map entry names neither a mode nor a full provider+model,
+# so nothing narrower than the company default has an opinion.
+UNOPINIONATED_MAP = {
+    RoleRank.SENIOR: {"provider": "anthropic", "api_key": "k"},
+    RoleRank.JUNIOR: {"provider": "anthropic", "api_key": "k", "mode": "auto"},
+}
+mode_policy = ModelPolicy(api_catalog=api_catalog(), allow_local=False)
+local_co = Company(name="Local Co", model_map=UNOPINIONATED_MAP,
+                   on_escalation=lambda e: EscalationDecision(approve=False),
+                   model_policy=mode_policy, default_policy_mode="local")
+inherited = local_co.hire("Inheritor", RoleRank.SENIOR)
+assert local_co.resolve_policy_mode(None, None) == "local"
+assert any(e["mode"] == "local" for e in local_co.activity().by_kind("model_policy")), \
+    "the hire should have been routed with the company default"
+# The rank that DOES name a mode keeps it - the default is a fallback, not an override.
+local_co.hire("Opinionated", RoleRank.JUNIOR)
+assert [e["mode"] for e in local_co.activity().by_kind("model_policy")] == ["local", "auto"]
+print("PASS 38: hires inherit default_policy_mode when nothing narrower names one")
+
+assert local_co.resolve_policy_mode("api", None) == "api"
+assert local_co.resolve_policy_mode(None, "auto") == "auto"
+print("PASS 39: hire(mode=) beats model_map[rank]['mode'] beats the company default")
+
+# A per-task re-route must not be able to cross the line the company drew -
+# reassign_model used to default to "auto" outright.
+local_co.reassign_model(inherited, effort="cheap")
+modes = [e["mode"] for e in local_co.activity().by_kind("model_policy")]
+assert modes[-1] == "local", modes
+print("PASS 40: reassign_model inherits the company default instead of forcing 'auto'")
+
+try:
+    Company(name="Bad", model_map=UNOPINIONATED_MAP,
+            on_escalation=lambda e: EscalationDecision(approve=False),
+            model_policy=mode_policy, default_policy_mode="loclal")
+    assert False, "expected a ValueError"
+except ValueError as e:
+    assert "did you mean 'local'?" in str(e), str(e)
+print("PASS 41: a bad company-wide default raises at construction rather than silently routing")
+
 
 print("\nAll Phase 4 model-policy checks passed.")

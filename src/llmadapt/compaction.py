@@ -26,6 +26,26 @@ record of where the money went and who authorized crossing a budget ceiling.
 `ALWAYS_KEEP_KINDS` protects that audit trail: escalations, escalation
 decisions, emergency-reserve draws and budget reallocations are never folded
 into a rollup, at any mode, regardless of age. Everything else is fair game.
+
+**Keeping an uncompacted record**: that is `archive.RunArchive`, and it is
+opt-in. `Company(archive=RunArchive(path))` appends every activity event and
+tool call to a JSONL file *as it happens* - before this module can collapse
+anything - so the file stays the untouched record even once the in-memory logs
+are rollups. The same archive takes the conversation transcript from any Agent
+it is handed to, so one file per run holds both.
+
+Two decisions worth stating, since both could plausibly have gone the other
+way. It writes at log time rather than at compaction time, because archiving a
+view that compaction has already touched archives the wrong thing, and because
+a run that dies before the first compaction would otherwise leave nothing at
+all - which is exactly the long unattended run this is for. And it is a file
+rather than a second in-memory list, because holding a full uncompacted copy in
+RAM spends the memory this module exists to bound, and loses everything in the
+one situation you most want it: a crash.
+
+`delete_on_clean_exit` covers "if everything went fine, delete it at the end" -
+`Company.finish()` decides what "fine" means, and refuses to call a run clean
+if any escalation went unresolved.
 """
 
 from dataclasses import dataclass, field

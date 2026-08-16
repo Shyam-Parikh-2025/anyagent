@@ -43,11 +43,14 @@ What this does NOT do, stated plainly:
 """
 
 import ast
+import asyncio
+import copy
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from .compressor import ContextCompressor
+from .core import run_coroutine_blocking
 from .router import RoleRank
 
 # ---------------------------------------------------------------------------
@@ -78,11 +81,35 @@ DEFAULT_IMPLEMENTER_RANKS: Sequence[str] = (
 MAX_STUBS = 20
 MAX_PLAN_STEPS = 12
 
+# How many lines of real logic (docstring excluded) an architect may write in a
+# function before it stops counting as the "small enough to just do in one
+# line" shortcut the ARCHITECT_PROMPT allows, and gets demoted back into the
+# stub pool for an implementer to fill properly.
+#
+# The rule the architect is given is narrow on purpose - a one-line body AND no
+# docstring - so this check is narrow to match. A function the architect wrote
+# *with* a docstring is a deliberate helper, which extract_stubs has always
+# kept verbatim in the preamble; that behaviour is unchanged. What this guards
+# is the specific failure the shortcut invites: the architect claiming it and
+# then writing twelve lines underneath, which is the whole job done unreviewed
+# by the one agent this strategy exists to keep out of implementation.
+MAX_ARCHITECT_BODY_LINES = 1
+
 
 # ---------------------------------------------------------------------------
 # Prompts (module-level so they are inspectable and overridable)
 # ---------------------------------------------------------------------------
 
+# The one-line shortcut below is a deliberate, bounded exception to "do NOT
+# implement anything", resolved rather than left open: a trivial helper costs a
+# whole implementer round-trip to fill, which is real money at the cheap tiers
+# this library targets, and an implementer adds nothing to `return x + 1`. The
+# trade it makes is that an architect-written body is never reviewed by a
+# second agent, so two things keep it honest - extract_stubs records every one
+# of them on `StubPlan.architect_implemented` (and stub_and_fill logs them, so
+# they are visible in the activity log rather than indistinguishable from
+# implementer work), and anything longer than MAX_ARCHITECT_BODY_LINES is
+# demoted back into the stub pool instead of being taken at its word.
 ARCHITECT_PROMPT = """You are the architect. Do NOT implement anything.
 
 TASK:
@@ -94,6 +121,9 @@ Produce a single Python module containing ONLY:
   and a complete docstring describing exactly what it must do, what it takes,
   what it returns, and any edge cases the implementer must handle
 - a body of exactly `...` for every one of them
+- in the case that the function needs decorators, include them
+- if a function is private, prefix it with an underscore
+- if a function is small enough that it can be implemented in one line, do not do docstring for it and just do it.
 
 Write no implementation logic. The docstring is your specification - an
 implementer will see only the module you write here, so anything you leave
@@ -170,6 +200,96 @@ def extract_code_block(text: str) -> str:
     return (text or "").strip()
 
 
+# The three node kinds this module ever treats as "a thing to fill in".
+# Named because several helpers below reach for `.name` and `.lineno`, which the
+# base ast.AST does not carry - annotating them as AST typechecked only because
+# nothing was looking.
+_Definition = Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef]
+
+
+def _source_of(code: str, node: ast.AST) -> str:
+    """The source text of a top-level `node`, **decorators included**.
+
+    `ast.get_source_segment()` alone is not enough here. Since Python 3.8 a
+    decorated def's `lineno` points at the `def` keyword, not at the first
+    decorator, so the decorators sit outside the segment it returns - they are
+    not in the returned stub, and because the decorators belong to the same
+    node they are not emitted as preamble either. They simply vanish, and the
+    assembled module compiles cleanly without them.
+
+    That is the single worst failure mode this module has (a syntactically
+    valid module that quietly does the wrong thing - the same reason a
+    surviving `...` is treated as an error), and it is invisible: an
+    `@property` or an `@functools.cache` that disappears changes behaviour
+    without changing whether anything parses. `StubPlan.interface()` made it
+    worse by going through `code_to_stub()`, which unparses the AST and so
+    *keeps* decorators - the implementer saw a decorator the assembler was
+    about to drop.
+
+    So widen the range to the first decorator by hand. Only top-level nodes
+    are passed here (both callers iterate `tree.body`), so the lines are at
+    column 0 and can be sliced directly.
+    """
+    decorators = list(getattr(node, "decorator_list", []) or [])
+    end = getattr(node, "end_lineno", None)
+    if decorators and end is not None:
+        lines = code.splitlines()
+        start = min(d.lineno for d in decorators) - 1
+        # A decorator node's lineno is the line its `@` is on, but scan up
+        # anyway rather than trusting that across versions and across
+        # decorators written over several lines.
+        while start > 0 and not lines[start].lstrip().startswith("@"):
+            start -= 1
+        if 0 <= start < len(lines):
+            return "\n".join(lines[start:end]).strip("\n")
+    segment = ast.get_source_segment(code, node)
+    return segment if segment is not None else ast.unparse(node)
+
+
+def _decorator_texts(node: ast.AST) -> Tuple[str, ...]:
+    """Each decorator on `node`, normalized through `ast.unparse`.
+
+    Unparsed rather than compared as raw text so that whitespace and quoting
+    differences between what the architect wrote and what the implementer
+    echoed back don't read as a changed decorator.
+    """
+    return tuple(ast.unparse(d) for d in getattr(node, "decorator_list", []) or [])
+
+
+def _logic_line_count(node: ast.AST) -> int:
+    """Lines of real logic in a def's body, docstring excluded.
+
+    Same measurement `ContextCompressor.code_to_stub` makes when deciding
+    whether a body is short enough to keep, and made the same way for the same
+    reason: unparsed rather than counted off the source, so formatting
+    (a body split over three lines for line-length reasons) doesn't change the
+    verdict.
+    """
+    body = list(getattr(node, "body", []))
+    if not body:
+        return 0
+    if (isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    if not body:
+        return 0
+    return len("\n".join(ast.unparse(stmt) for stmt in body).splitlines())
+
+
+def _strip_to_stub(code: str, node: "_Definition") -> str:
+    """An implemented def rewritten back into a stub, body replaced by `...`.
+
+    Used when the architect took the one-line shortcut and then wrote more
+    than MAX_ARCHITECT_BODY_LINES, so the function goes back into the pool for
+    an implementer. Rebuilt from the AST (decorators, signature and type hints
+    survive `ast.unparse`) rather than by slicing text, since the body is
+    exactly the part being discarded.
+    """
+    clone = copy.deepcopy(node)
+    clone.body = [ast.Expr(value=ast.Constant(value=Ellipsis))]  # type: ignore[attr-defined]
+    return ast.unparse(ast.fix_missing_locations(clone))
+
+
 def _is_stub_body(node: ast.AST) -> bool:
     """Whether a def's body is empty in the stub sense: nothing but a
     docstring, `pass`, and/or `...`."""
@@ -192,13 +312,21 @@ class Stub:
 
     name: str
     kind: str  # "function" | "async function" | "class"
-    source: str  # the stub as written by the architect
+    source: str  # the stub as written by the architect, decorators included
     docstring: str = ""
     signature: str = ""
+    # Normalized decorator expressions, so the filled implementation can be
+    # checked for having kept them - see _implementation_for.
+    decorators: Tuple[str, ...] = ()
+    # Set when the architect implemented this itself but wrote too much to
+    # qualify for the one-line shortcut, so it was demoted back into the pool.
+    demoted_reason: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {"name": self.name, "kind": self.kind, "signature": self.signature,
-                "docstring": self.docstring, "source": self.source}
+                "docstring": self.docstring, "source": self.source,
+                "decorators": list(self.decorators),
+                "demoted_reason": self.demoted_reason}
 
 
 @dataclass
@@ -211,10 +339,22 @@ class StubPlan:
     stubs: List[Stub] = field(default_factory=list)
     preamble: str = ""
     parse_error: Optional[str] = None
+    # Functions the architect implemented itself under the prompt's one-line
+    # shortcut. They are legitimately in the preamble and no implementer is
+    # paid to fill them - but they are also the only code in the assembled
+    # module that no second agent ever looked at, so they are named here (and
+    # logged by stub_and_fill) rather than being indistinguishable from work
+    # an implementer did.
+    architect_implemented: List[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return self.parse_error is None
+
+    @property
+    def demoted(self) -> List[str]:
+        """Stubs that exist because the architect over-implemented them."""
+        return [s.name for s in self.stubs if s.demoted_reason]
 
     def interface(self) -> str:
         """The stub module as an implementer should see it - normalized through
@@ -224,16 +364,38 @@ class StubPlan:
 
     def to_dict(self) -> Dict[str, Any]:
         return {"stubs": [s.to_dict() for s in self.stubs], "preamble": self.preamble,
-                "parse_error": self.parse_error}
+                "parse_error": self.parse_error,
+                "architect_implemented": list(self.architect_implemented),
+                "demoted": self.demoted}
 
 
-def extract_stubs(source: str, max_stubs: int = MAX_STUBS) -> StubPlan:
+def extract_stubs(
+    source: str,
+    max_stubs: int = MAX_STUBS,
+    max_architect_body_lines: int = MAX_ARCHITECT_BODY_LINES,
+) -> StubPlan:
     """Parse an architect's module into a StubPlan.
 
     A top-level `def`/`async def`/`class` whose body is only a docstring,
     `pass`, and/or `...` is a stub to fill. Everything else - imports,
     constants, fully-written helpers the architect decided to provide - is
     preamble and is preserved verbatim.
+
+    Decorators travel with the thing they decorate, in both directions - see
+    `_source_of` for why that needs saying.
+
+    The prompt lets the architect implement a function outright when it fits on
+    one line and needs no docstring. Those are recognised here rather than
+    taken on trust:
+
+    - implemented, no docstring, within `max_architect_body_lines` - allowed,
+      kept in the preamble, and its name recorded on `architect_implemented`
+      so the result object can say which code no implementer ever saw.
+    - implemented, no docstring, longer than that - the architect claimed the
+      shortcut and then wrote a real implementation. It is stripped back to a
+      stub and put in the pool, carrying `demoted_reason`.
+    - implemented **with** a docstring - a deliberate helper, which this
+      function has always kept verbatim in the preamble. Unchanged.
 
     A module that doesn't parse comes back with `parse_error` set and no stubs,
     rather than raising: the architect is a language model, occasionally emits
@@ -249,28 +411,50 @@ def extract_stubs(source: str, max_stubs: int = MAX_STUBS) -> StubPlan:
     lines = code.splitlines()
     stubs: List[Stub] = []
     preamble_parts: List[str] = []
+    architect_implemented: List[str] = []
+
+    def make_stub(node: _Definition, source: str, demoted_reason: str = "") -> Stub:
+        kind = ("class" if isinstance(node, ast.ClassDef)
+                else "async function" if isinstance(node, ast.AsyncFunctionDef) else "function")
+        signature = ""
+        if node.lineno - 1 < len(lines):
+            signature = lines[node.lineno - 1].strip()
+        return Stub(
+            name=node.name, kind=kind, source=source,
+            docstring=ast.get_docstring(node) or "", signature=signature,
+            decorators=_decorator_texts(node), demoted_reason=demoted_reason,
+        )
 
     for node in tree.body:
-        segment = ast.get_source_segment(code, node)
-        if segment is None:  # pragma: no cover - defensive; get_source_segment can return None
-            segment = ast.unparse(node)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and _is_stub_body(node):
-            kind = ("class" if isinstance(node, ast.ClassDef)
-                    else "async function" if isinstance(node, ast.AsyncFunctionDef) else "function")
-            signature = ""
-            if node.lineno - 1 < len(lines):
-                signature = lines[node.lineno - 1].strip()
-            stubs.append(Stub(
-                name=node.name, kind=kind, source=segment,
-                docstring=ast.get_docstring(node) or "", signature=signature,
-            ))
-        else:
+        segment = _source_of(code, node)
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             preamble_parts.append(segment)
+            continue
+
+        if _is_stub_body(node):
+            stubs.append(make_stub(node, segment))
+            continue
+
+        if not isinstance(node, ast.ClassDef) and not ast.get_docstring(node):
+            # The one-line shortcut. A class is never eligible: "small enough
+            # for one line" is a statement about a function body, and a
+            # docstring-less class is far more likely to be a data holder the
+            # architect meant as preamble than a claimed shortcut.
+            body_lines = _logic_line_count(node)
+            if body_lines > max_architect_body_lines:
+                reason = (f"architect implemented it in {body_lines} lines without a docstring; "
+                          f"the one-line shortcut allows at most {max_architect_body_lines}")
+                stubs.append(make_stub(node, _strip_to_stub(code, node), demoted_reason=reason))
+                continue
+            architect_implemented.append(node.name)
+
+        preamble_parts.append(segment)
 
     return StubPlan(
         module_source=code,
         stubs=stubs[:max_stubs],
         preamble="\n\n".join(preamble_parts).strip(),
+        architect_implemented=architect_implemented,
     )
 
 
@@ -300,6 +484,13 @@ def _implementation_for(stub: Stub, reply: str) -> FilledStub:
     the requested name, or that still has a stub body, is an error rather than
     a silent pass: a `...` that survives assembly would be a syntax-valid
     module that does nothing, which is the worst possible failure mode here.
+
+    A dropped or rewritten **decorator** is treated the same way, and for the
+    same reason. An implementer that returns the right function body without
+    the `@property` it was given produces a module that compiles and behaves
+    differently - exactly the silent-wrongness this function exists to catch,
+    just one line higher up. Comparison is on unparsed decorator expressions,
+    so reformatting is not a change.
     """
     code = extract_code_block(reply)
     if not code.strip():
@@ -313,8 +504,16 @@ def _implementation_for(stub: Stub, reply: str) -> FilledStub:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == stub.name:
             if _is_stub_body(node):
                 return FilledStub(stub=stub, error="implementer returned another stub, not a body")
-            segment = ast.get_source_segment(code, node) or ast.unparse(node)
-            return FilledStub(stub=stub, implementation=segment.strip())
+            got = _decorator_texts(node)
+            if stub.decorators and got != stub.decorators:
+                missing = [d for d in stub.decorators if d not in got]
+                detail = (f"dropped {', '.join('@' + d for d in missing)}" if missing
+                          else f"changed them to {', '.join('@' + d for d in got) or 'none'}")
+                return FilledStub(
+                    stub=stub,
+                    error=f"implementer did not keep the decorators on {stub.name!r} ({detail})",
+                )
+            return FilledStub(stub=stub, implementation=_source_of(code, node).strip())
 
     return FilledStub(
         stub=stub,
@@ -339,6 +538,16 @@ class StubAndFillResult:
         return [f.stub.name for f in self.filled if not f.ok]
 
     @property
+    def architect_implemented(self) -> List[str]:
+        """Functions the architect wrote itself under the one-line shortcut.
+
+        Surfaced on the result, not just the plan, because "which parts of
+        this module did no second agent look at?" is a question about the
+        delivered artifact - the same class of question as `unfilled`.
+        """
+        return list(self.plan.architect_implemented)
+
+    @property
     def ok(self) -> bool:
         return self.plan.ok and not self.unfilled and self.syntax_error is None
 
@@ -348,6 +557,8 @@ class StubAndFillResult:
             "stubs": [f.to_dict() for f in self.filled],
             "unfilled": self.unfilled, "syntax_error": self.syntax_error,
             "parse_error": self.plan.parse_error,
+            "architect_implemented": self.architect_implemented,
+            "demoted": self.plan.demoted,
         }
 
 
@@ -424,6 +635,28 @@ def stub_and_fill(
     max_stubs: int = MAX_STUBS,
     architect_prompt: str = ARCHITECT_PROMPT,
     implementer_prompt: str = IMPLEMENTER_PROMPT,
+    max_architect_body_lines: int = MAX_ARCHITECT_BODY_LINES,
+) -> StubAndFillResult:
+    """Synchronous wrapper over stub_and_fill_async(). See that for the docs."""
+    return run_coroutine_blocking(
+        lambda: stub_and_fill_async(
+            company, task, architect=architect, implementers=implementers,
+            max_stubs=max_stubs, architect_prompt=architect_prompt,
+            implementer_prompt=implementer_prompt,
+            max_architect_body_lines=max_architect_body_lines),
+        what="stub_and_fill()",
+    )
+
+
+async def stub_and_fill_async(
+    company: Any,
+    task: str,
+    architect: Optional[Any] = None,
+    implementers: Optional[Sequence[Any]] = None,
+    max_stubs: int = MAX_STUBS,
+    architect_prompt: str = ARCHITECT_PROMPT,
+    implementer_prompt: str = IMPLEMENTER_PROMPT,
+    max_architect_body_lines: int = MAX_ARCHITECT_BODY_LINES,
 ) -> StubAndFillResult:
     """Architect writes the interface; implementers fill the bodies.
 
@@ -441,10 +674,13 @@ def stub_and_fill(
     pool = list(implementers or choose_implementers(company, exclude=[architect]))
 
     company._log("stub_architect_start", employee=architect.name, task=task[:200])
-    module_source = architect.run(architect_prompt.format(task=task, max_stubs=max_stubs), company=company)
-    plan = extract_stubs(module_source, max_stubs=max_stubs)
+    module_source = await architect.run_async(architect_prompt.format(task=task, max_stubs=max_stubs), company=company)
+    plan = extract_stubs(module_source, max_stubs=max_stubs,
+                         max_architect_body_lines=max_architect_body_lines)
     company._log("stub_architect_done", employee=architect.name,
-                 stub_count=len(plan.stubs), parse_error=plan.parse_error)
+                 stub_count=len(plan.stubs), parse_error=plan.parse_error,
+                 architect_implemented=plan.architect_implemented,
+                 demoted=plan.demoted)
 
     result = StubAndFillResult(task=task, plan=plan, architect=architect.name)
     if not plan.ok:
@@ -458,11 +694,36 @@ def stub_and_fill(
         return result
 
     interface = plan.interface()
-    for index, stub in enumerate(plan.stubs):
-        implementer = pool[index % len(pool)] if pool else architect
-        reply = implementer.run(
+
+    # The one place in this library where fan-out is unambiguously free: every
+    # stub is filled from the same frozen interface and never sees another
+    # stub's body, so N stubs are N independent calls. plan_then_execute below
+    # is the opposite case and stays sequential.
+    #
+    # Round-robin can hand two stubs to the same implementer; Employee.run_async
+    # takes that employee's own lock, so those two serialize while the rest keep
+    # going. Nothing here has to know that.
+    assignments = [(pool[index % len(pool)] if pool else architect, stub)
+                   for index, stub in enumerate(plan.stubs)]
+
+    async def _fill(implementer: Any, stub: "Stub") -> Any:
+        return await implementer.run_async(
             implementer_prompt.format(interface=interface, stub=stub.source), company=company
         )
+
+    replies = await asyncio.gather(
+        *(_fill(implementer, stub) for implementer, stub in assignments),
+        return_exceptions=True,
+    )
+    # gather(return_exceptions=True) so one implementer blowing up does not
+    # leave its siblings running unattended with nobody holding their results.
+    # The first real failure is still raised, exactly as the sequential version
+    # did - it just happens after everyone has finished rather than mid-flight.
+    for reply in replies:
+        if isinstance(reply, BaseException):
+            raise reply
+
+    for (implementer, stub), reply in zip(assignments, replies):
         item = _implementation_for(stub, reply)
         item.employee = implementer.name
         result.filled.append(item)
@@ -550,7 +811,35 @@ def plan_then_execute(
     step_prompt: str = STEP_PROMPT,
     synthesis_prompt: str = SYNTHESIS_PROMPT,
 ) -> PlanResult:
+    """Synchronous wrapper over plan_then_execute_async(). See that for the docs."""
+    return run_coroutine_blocking(
+        lambda: plan_then_execute_async(
+            company, task, planner=planner, executors=executors, max_steps=max_steps,
+            synthesize=synthesize, context_chars=context_chars,
+            planner_prompt=planner_prompt, step_prompt=step_prompt,
+            synthesis_prompt=synthesis_prompt),
+        what="plan_then_execute()",
+    )
+
+
+async def plan_then_execute_async(
+    company: Any,
+    task: str,
+    planner: Optional[Any] = None,
+    executors: Optional[Sequence[Any]] = None,
+    max_steps: int = MAX_PLAN_STEPS,
+    synthesize: bool = True,
+    context_chars: int = 1200,
+    planner_prompt: str = PLANNER_PROMPT,
+    step_prompt: str = STEP_PROMPT,
+    synthesis_prompt: str = SYNTHESIS_PROMPT,
+) -> PlanResult:
     """Plan first, then carry the steps out in order.
+
+    Deliberately NOT parallelized, unlike stub_and_fill_async. Each step is
+    handed a digest of what the earlier steps produced - that is the whole
+    design of the strategy - so step 3 cannot start before step 2 has an
+    answer. Fanning these out would not be faster, it would be wrong.
 
     Each step sees a compressed digest of what earlier steps produced, not
     their full output - `ContextCompressor.compress_tool_output` does the
@@ -571,7 +860,7 @@ def plan_then_execute(
     pool = list(executors or choose_implementers(company, exclude=[planner]))
 
     company._log("plan_start", employee=planner.name, task=task[:200])
-    plan_text = planner.run(planner_prompt.format(task=task, max_steps=max_steps), company=company)
+    plan_text = await planner.run_async(planner_prompt.format(task=task, max_steps=max_steps), company=company)
     instructions = parse_plan_steps(plan_text, max_steps=max_steps)
 
     result = PlanResult(task=task, planner=planner.name)
@@ -589,7 +878,7 @@ def plan_then_execute(
         context = "\n".join(context_parts) if context_parts else "(nothing yet - this is the first step)"
         step = PlanStep(index=index + 1, instruction=instruction, employee=executor.name)
         try:
-            step.result = executor.run(
+            step.result = await executor.run_async(
                 step_prompt.format(task=task, context=context, step=instruction), company=company
             )
         except Exception as e:  # a step failing shouldn't discard the rest of the plan
@@ -602,7 +891,7 @@ def plan_then_execute(
     successful = [s for s in result.steps if s.error is None]
     if synthesize and successful:
         results_text = "\n\n".join(f"Step {s.index}: {s.instruction}\n{s.result}" for s in successful)
-        result.answer = planner.run(
+        result.answer = await planner.run_async(
             synthesis_prompt.format(task=task, results=results_text), company=company
         )
         company._log("plan_synthesized", employee=planner.name)
@@ -615,8 +904,9 @@ def plan_then_execute(
 __all__ = [
     "Stub", "StubPlan", "FilledStub", "StubAndFillResult",
     "extract_code_block", "extract_stubs", "assemble_module", "stub_and_fill",
+    "stub_and_fill_async", "plan_then_execute_async",
     "PlanStep", "PlanResult", "parse_plan_steps", "plan_then_execute",
     "choose_architect", "choose_implementers",
     "DEFAULT_ARCHITECT_RANKS", "DEFAULT_IMPLEMENTER_RANKS",
-    "MAX_STUBS", "MAX_PLAN_STEPS",
+    "MAX_STUBS", "MAX_PLAN_STEPS", "MAX_ARCHITECT_BODY_LINES",
 ]

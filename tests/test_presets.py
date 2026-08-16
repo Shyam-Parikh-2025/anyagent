@@ -27,6 +27,7 @@ from llmadapt.presets import (
     default_bundle,
     skill_hints,
 )
+from llmadapt.policy import _EFFORT_ALIASES
 from llmadapt.router import RoleRank
 
 
@@ -261,6 +262,7 @@ assert "secret" in emp.agent.conversation.system_instruction
 assert "private-skill" not in SKILLS
 print("PASS 26: a forked PresetBundle isolates custom registrations from the global registries")
 
+assert isinstance(default_bundle(), PresetBundle)
 assert set(default_bundle().names()) == {"skills", "personalities", "palettes", "org_templates"}
 assert all(isinstance(v, list) for v in default_bundle().describe().values())
 print("PASS 27: PresetBundle exposes names()/describe() across all four kinds (Phase 8's schema source)")
@@ -408,5 +410,93 @@ for employee in tmpl_co.employees.values():
 tmpl_team.lead.agent._send_request = FakeResponder([text_response("the copy")])
 assert tmpl_team.review_mode == "critique"
 print("PASS 42: a template-built team comes back with its review loop configured")
+
+# ---------------------------------------------------------------------------
+# Catalog invariants
+# ---------------------------------------------------------------------------
+# The built-ins are content, and content is what rots. These check the things
+# that would break quietly as the catalogs grow: a template naming a skill that
+# was renamed, a palette missing a rank, a skill claiming an effort level that
+# does not exist. Every one of them is a runtime failure a user hits, not a
+# style point.
+
+from llmadapt.policy import EFFORT_LEVELS  # noqa: E402
+
+for skill in SKILLS.all():
+    assert skill.instructions.strip(), f"skill {skill.name!r} has no instructions"
+    assert skill.description.strip(), f"skill {skill.name!r} has no description"
+    assert skill.effort in (None,) + tuple(EFFORT_LEVELS), \
+        f"skill {skill.name!r} declares effort {skill.effort!r}, which is not a real level"
+print(f"PASS 44: all {len(SKILLS)} built-in skills carry instructions and a valid effort hint")
+
+for personality in PERSONALITIES.all():
+    assert personality.instructions.strip(), f"personality {personality.name!r} has no instructions"
+print(f"PASS 45: all {len(PERSONALITIES)} built-in personalities carry instructions")
+
+for palette in PALETTES.all():
+    assert len(palette.ranks_light) >= len(RoleRank.ORDER), f"{palette.name}: light theme short"
+    assert len(palette.ranks_dark) >= len(RoleRank.ORDER), f"{palette.name}: dark theme short"
+    for rank in RoleRank.ORDER:
+        for theme in ("light", "dark"):
+            colour = palette.color_for_rank(rank, theme)
+            assert colour.startswith("#") and len(colour) == 7, f"{palette.name}/{rank}: {colour!r}"
+validated = [p.name for p in PALETTES.all() if p.colorblind_validated]
+assert validated == ["dataviz"], validated
+print(f"PASS 46: all {len(PALETTES)} palettes cover every rank in both themes, and only dataviz "
+      "claims the colourblind validation")
+
+# A template referring to a preset that no longer exists fails at build time,
+# with a KeyError from a registry, which is a confusing place to learn about it.
+for template in ORG_TEMPLATES.all():
+    for role in template.roles:
+        for skill_name in role.skills:
+            assert skill_name in SKILLS, f"template {template.name!r} names unknown skill {skill_name!r}"
+        if role.personality:
+            assert role.personality in PERSONALITIES, \
+                f"template {template.name!r} names unknown personality {role.personality!r}"
+        assert role.effort in (None,) + tuple(EFFORT_LEVELS) or role.effort in _EFFORT_ALIASES, \
+            f"template {template.name!r} role {role.key!r} has effort {role.effort!r}"
+print(f"PASS 47: every role in all {len(ORG_TEMPLATES)} templates names presets that exist")
+
+for template in ORG_TEMPLATES.all():
+    problems = template.validate()
+    assert not problems, f"template {template.name!r}: {problems}"
+    for size in TASK_SIZES:
+        roles = template.roles_for(size)
+        assert roles, f"template {template.name!r} produces no roles at size {size!r}"
+        leads = [r for r in roles if r.lead]
+        assert len(leads) == 1, f"template {template.name!r} at {size!r} has {len(leads)} leads"
+print("PASS 48: every template validates and has exactly one lead at every size")
+
+# And they must actually build - the check above is structural, this one runs
+# the real hire path for every template at every size.
+built = 0
+for name in ORG_TEMPLATES.names():
+    for size in TASK_SIZES:
+        co = make_company()
+        co.build_from_template(name, size=size)
+        assert co.employees, f"{name}/{size} built nothing"
+        built += 1
+print(f"PASS 49: all {len(ORG_TEMPLATES)} templates build a real company at every size ({built} builds)")
+
+# The catalog is meant to be big enough that the common case is picking one
+# rather than writing one. A floor rather than an exact count, since the point
+# is "there is enough here to choose from" and pinning the number would turn
+# every future addition into a test edit.
+for label, registry in (("skills", SKILLS), ("personalities", PERSONALITIES),
+                        ("palettes", PALETTES), ("templates", ORG_TEMPLATES)):
+    assert len(registry) >= 20, f"only {len(registry)} built-in {label} - the catalog has shrunk"
+# Names are the API - two presets answering to the same name would make
+# hire(skills=[...]) ambiguous, and a name with a space in it is awkward
+# everywhere it travels (JSON, the GUI, a CLI argument).
+for registry in (SKILLS, PERSONALITIES, PALETTES, ORG_TEMPLATES):
+    names = registry.names()
+    assert len(names) == len(set(names)), f"duplicate preset names: {names}"
+    for name in names:
+        assert name == name.strip().lower() and " " not in name, f"awkward preset name {name!r}"
+print(f"PASS 50: every registry carries at least 20 built-ins with unique, well-formed names "
+      f"({len(SKILLS)} skills, {len(PERSONALITIES)} personalities, {len(PALETTES)} palettes, "
+      f"{len(ORG_TEMPLATES)} templates)")
+
 
 print("\nAll Phase 5 preset-registry checks passed.")

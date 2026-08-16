@@ -22,6 +22,56 @@ class RoleRank:
     ORDER = [C_SUITE, GENERAL_MANAGER, MANAGER, SENIOR, JUNIOR, INTERN, VOLUNTEER]
 
 
+# `role` is RoleRank under a second, lowercase name - not a copy, the exact
+# same class object - so a rank reads as `role.SENIOR` instead of
+# `RoleRank.SENIOR`. This replaces an earlier attempt at this that bound
+# C_SUITE/MANAGER/SENIOR/JUNIOR/INTERN/VOLUNTEER as bare top-level names:
+# shorter to type, but MANAGER/SENIOR/JUNIOR/INTERN are common enough English
+# words that `from llmadapt import *` (or even just picking a local variable
+# name) could collide with one. Namespacing under one lowercase name cuts
+# that risk from seven common words down to one - the same shape the standard
+# library already uses for exactly this (`logging.INFO`, `logging.DEBUG`,
+# `socket.AF_INET`, `errno.ENOENT`, `stat.S_IRUSR`): a short, lowercase
+# module-like handle in front of the actual constants, instead of either the
+# full class name or nothing in front of them at all.
+#
+# `role` is still a single common word, and this module's own org_templates.py
+# uses `role` constantly as a *loop variable* (`for role in roles: ...`) - a
+# local `role = ...` inside a function shadows the imported namespace for that
+# function only, which is ordinary Python scoping and not a bug, but it means
+# `role.SENIOR` won't resolve inside a block that's already reusing the name
+# for something else. `RoleRank.SENIOR` remains available, unchanged, as the
+# zero-ambiguity spelling for anyone who'd rather not have even that.
+#
+# `role` is deliberately NOT re-exported from the top-level `llmadapt`
+# package - only `RoleRank` is, same as always. Getting `role` requires an
+# explicit `from llmadapt.router import role` (or `from llmadapt.company
+# import mode, review` for its two siblings below) rather than falling out of
+# a bare `from llmadapt import *`. That trades one extra word in the import
+# line for confining the collision risk to callers who deliberately opted in,
+# rather than handing it to everyone who imports the package at all.
+#
+# Why this stays a plain class of string constants and not `class
+# RoleRank(str, Enum)` (or 3.11+'s `StrEnum`, which pyproject.toml's
+# `python_requires>=3.9` rules out outright): a real Enum CAN be made to
+# behave exactly like a string everywhere - equality, hashing, dict-key use,
+# and JSON serialization all already work correctly with a `str` mixin - but
+# `f"{RoleRank.SENIOR}"` and `str(RoleRank.SENIOR)` do NOT come out as
+# "SENIOR" by default; Enum's own `__str__`/`__format__` win over the mixin
+# and print "RoleRank.SENIOR" instead (confirmed against a live interpreter,
+# not assumed). Fixing that means remembering to add
+# `__str__ = str.__str__` inside the class body - a one-line fix, but an easy
+# one to forget, and this codebase embeds ranks into f-strings constantly
+# (escalation messages, system-instruction role lines, error text) where the
+# regression would be silent: a subtly wrong string handed to an LLM or
+# printed in a log, not an exception. A plain class was already zero-risk on
+# every one of those axes with no extra line required, and the typo-detection
+# an Enum would add is already covered by `did_you_mean()` at validation time
+# - so the extra machinery buys real but marginal safety at a real, easy-to-
+# miss cost. Not worth it for a set of values this small and this static.
+role = RoleRank
+
+
 class ModelRouter:
     """Evaluates tasks, checks hardware constraints, and maps LLMs dynamically."""
 

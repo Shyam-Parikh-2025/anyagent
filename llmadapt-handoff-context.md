@@ -5,9 +5,9 @@ Companion to `company-roadmap.md`. The roadmap is the authoritative record of
 that: conventions, decisions that shouldn't be re-opened, the file map, and how
 to pick the work up next.
 
-**This replaces the previous handoff doc**, which was written before Phases 4-8
-existed and described them as not-yet-built. All eight phases are now done,
-tested and documented.
+**This replaces the previous handoff doc.** Phases 0-8 are done; Phase 9 (the
+TODO pass) is done on top of them. Every `# TODO` decision point in the library
+is now closed - implemented, or answered in the docstring where it stood.
 
 ## 1. Project identity
 
@@ -32,16 +32,20 @@ tested and documented.
 | 6 | `delegation.py` | Stub-and-fill + plan-then-execute |
 | 7 | `compaction.py` | "Broad concepts, drop specifics" log compaction |
 | 8 | `builder.py`, `gui.py`, `gui_assets.py` | `set_company_up(mode="text"\|"gui")` |
+| 9 | `company/`, `suggest.py`, `archive.py` | TODO pass: package split, cost-weighted budget, run archive, typo suggestions, company-wide policy mode |
+| 10 | `env.py`, `presets/`, `compressor.py` | Pinned context, preset package + bigger catalogs, .env loading and layered key resolution |
 
-Full suite: **14 files, 275 checks**, all passing (verified on the Windows
-machine under Python 3.10, and against a built wheel).
+Full suite: **17 files, 403 checks**, all passing.
 
 ## 3. Engineering conventions — still load-bearing
 
 - **Zero third-party dependencies.** Optional deps (numpy, torch) are used
   opportunistically only when already installed, always with a fallback — see
   `benchmark.py`. This now extends to the front end: the Phase 8 GUI is vanilla
-  JS + SVG with no framework, no CDN and no build step.
+  JS + SVG with no framework, no CDN and no build step. Enforced rather than
+  merely stated: Phase 10 found an `import dotenv` that had crept into
+  `core.py`'s demo block and replaced it with the library's own
+  `env.load_env()`. Worth grepping for stray imports occasionally.
 - **Test style**: plain `assert` + `print("PASS: ...")`, no pytest, no
   framework. Offline `FakeResponder` standing in for an `Agent`'s HTTP layer
   via `agent._send_request = FakeResponder([...])`. Every new module gets its
@@ -89,7 +93,7 @@ escalation, 0-means-always-ask reserves, fixed rank budget shares, per-employee
 
 ```
 src/llmadapt/
-  __init__.py       - public API (54 exports)
+  __init__.py       - public API (58 exports)
   core.py           - Agent/Conversation/ToolRegistry
   compressor.py     - CompressionPolicy / ContextCompressor / HistoryCompactionPolicy
   hardware.py       - ResourceQuota, HardwareProfiler
@@ -97,11 +101,27 @@ src/llmadapt/
   local_agent.py    - find_local_model()
   selector.py       - ModelCatalog + LocalModelSelector (local fit-tier ranking)
   router.py         - ModelRouter, RoleRank
-  company.py        - Employee/Team/Company (Phases 0-3, plus 4-8 wiring)
+  suggest.py        - did_you_mean / closest_name              (Phase 9)
+  env.py            - .env loading + layered key resolution     (Phase 10)
+  archive.py        - RunArchive                               (Phase 9)
+  company/          - the hierarchy, split out of company.py   (Phase 9)
+    __init__.py     - re-exports every pre-split import path
+    escalation.py   - EscalationEvent/Decision/Unresolved
+    employee.py     - Employee
+    team.py         - Team + the review-loop prompts
+    company.py      - Company
   budget.py         - BudgetLedger                          (Phase 3)
   observability.py  - EventLog, org-chart renderers         (Phase 2)
   policy.py         - ModelPolicy, ApiModelCatalog          (Phase 4)
-  presets.py        - PresetRegistry x4, compose_system_instruction (Phase 5)
+  presets/          - the four registries, split up            (Phase 10)
+    __init__.py     - re-exports every pre-split import path
+    registry.py     - Preset + PresetRegistry (the mechanism, alone)
+    skills.py       - Skill + 15 built-ins
+    personalities.py- Personality + 10 built-ins
+    palettes.py     - Palette + 8 built-ins
+    org_templates.py- RoleSpec/OrgTemplate + 11 built-ins
+    bundle.py       - PresetBundle / default_bundle
+    compose.py      - compose_system_instruction / skill_hints
   delegation.py     - stub_and_fill, plan_then_execute      (Phase 6)
   compaction.py     - LogCompactionPolicy                   (Phase 7)
   builder.py        - CompanySpec, set_company_up(text)     (Phase 8)
@@ -115,6 +135,9 @@ tests/
   test_selector.py, test_company.py, test_observability.py, test_budget.py,
   test_policy.py, test_presets.py, test_delegation.py, test_compaction.py,
   test_builder.py, test_gui.py
+  test_archive.py      - RunArchive, history compaction, pins       (Phase 9-10)
+  test_env.py          - .env parsing and key resolution             (Phase 10)
+  test_import_paths.py - the guard on the company/ split             (Phase 9)
   test_trial_own.py    - an interactive REPL scratchpad, skipped by the runner
 ```
 

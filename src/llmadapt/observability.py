@@ -24,7 +24,7 @@ default-resolution helper; the colours themselves are presets.
 """
 
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 class EventLog:
@@ -66,13 +66,21 @@ def record_tool_call(
     result: Any,
     duration_s: float,
     error: Optional[str] = None,
+    archive: Optional[Any] = None,
 ) -> None:
     """Appends one entry to a tool-call log (e.g. Company.tool_call_log).
     Kept as a free function rather than a class - the log itself is just a
     list, callers append their own shaped entries too if they want; this is
-    the shape delegation calls use."""
+    the shape delegation calls use.
+
+    `archive` is an optional archive.RunArchive written through at the same
+    moment, so the archived record predates any Phase 7 compaction of `log`.
+    The archived copy carries the **full** result rather than the 200-char
+    preview: the preview exists to keep the in-memory log small, which is
+    exactly the constraint a file on disk does not have, and "what did that
+    tool actually return?" is a main reason to keep an archive at all."""
     result_str = result if isinstance(result, str) else str(result)
-    log.append({
+    entry = {
         "time": time.time(),
         "employee": employee,
         "tool_name": tool_name,
@@ -80,7 +88,10 @@ def record_tool_call(
         "result_preview": result_str[:200],
         "duration_s": round(duration_s, 4),
         "error": error,
-    })
+    }
+    log.append(entry)
+    if archive is not None:
+        archive.append("tool_call", dict(entry, result=result_str))
 
 
 # ---- org chart rendering ---------------------------------------------------

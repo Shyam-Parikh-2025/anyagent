@@ -40,6 +40,7 @@ no network calls, no model loading. That is what makes it testable offline
 without paying for anything.
 """
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -47,6 +48,9 @@ from .benchmark import BenchmarkResult
 from .hardware import ResourceQuota
 from .router import ModelRouter, RoleRank
 from .selector import LocalModelCandidate, ModelCatalog, SelectionResult
+from .suggest import did_you_mean
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Effort hints
@@ -462,13 +466,55 @@ class ModelPolicy:
     # -- effort ------------------------------------------------------------
 
     def resolve_effort(self, effort: Optional[str], rank: Optional[str]) -> str:
+        """The effort level to actually use, from an explicit hint or the rank
+        default. Never raises - see `_unrecognized_effort` for why, and for
+        what happens instead."""
+        resolved, _ = self.resolve_effort_explained(effort, rank)
+        return resolved
+
+    def resolve_effort_explained(
+        self, effort: Optional[str], rank: Optional[str]
+    ) -> Tuple[str, str]:
+        """`resolve_effort`, plus a note when the hint wasn't understood.
+
+        Split out so `decide()` can carry that note into the PolicyDecision's
+        `reason`. The note is "" whenever the hint was recognised or absent, so
+        the common path adds nothing.
+        """
+        note = ""
         if effort is not None:
             key = str(effort).strip().lower()
             if key in _EFFORT_ALIASES:
-                return _EFFORT_ALIASES[key]
+                return _EFFORT_ALIASES[key], note
+            note = self._unrecognized_effort(key, rank)
         if rank is not None and rank in self.rank_effort:
-            return self.rank_effort[rank]
-        return EFFORT_BALANCED
+            return self.rank_effort[rank], note
+        return EFFORT_BALANCED, note
+
+    def _unrecognized_effort(self, key: str, rank: Optional[str]) -> str:
+        """Warn about an effort hint that didn't match, and suggest the nearest
+        real one.
+
+        Phase 4 decided an unrecognized hint falls back to the rank default
+        rather than raising, because this value arrives from a model filling in
+        a tool schema and a typo must not take a running company down. That
+        decision stands. What didn't work is that the fallback was *silent*:
+        `resolve_effort("balnced", "JUNIOR")` quietly returned "cheap", the
+        lowest tier, so a one-character typo downgraded an employee's model and
+        nothing anywhere said so.
+
+        A misspelled *skill* has always raised a KeyError listing the valid
+        names (PresetRegistry.get). This closes that asymmetry from the other
+        end - still no exception, but a warning, a suggestion, and a line in
+        the decision's reason, so "why is this employee on this model?" stays
+        answerable later, which is the whole point of storing the decision.
+        """
+        suggestion = did_you_mean(key, tuple(EFFORT_LEVELS) + tuple(_EFFORT_ALIASES))
+        fallback = self.rank_effort.get(rank or "", EFFORT_BALANCED)
+        note = (f"effort hint {key!r} was not recognized, so the "
+                f"{rank or 'library'} default ({fallback}) was used instead{suggestion}")
+        logger.warning("ModelPolicy: %s", note)
+        return note
 
     # -- API side ----------------------------------------------------------
 
@@ -595,7 +641,6 @@ class ModelPolicy:
         )
 
     # -- the entry point ---------------------------------------------------
-
     def decide(
         self,
         rank: Optional[str] = None,
@@ -609,6 +654,12 @@ class ModelPolicy:
         """Pick a model for one employee/task. Never raises for a routing
         failure - returns kind="unavailable" with a reason instead.
 
+        Thin wrapper over `_decide`: it resolves the effort hint once (so an
+        unrecognized one is warned about once, not once per internal lookup)
+        and appends that note to whatever reason the decision came back with.
+        Doing it here rather than at each of `_decide`'s eight return paths
+        means a new return path cannot forget to carry it.
+
         requested_model/requested_provider pin a specific model. In
         mode="local" that pins the *local* selection (and reports an install
         hint if it isn't installed); otherwise a pinned model found in the API
@@ -620,8 +671,28 @@ class ModelPolicy:
         local request should not quietly start spending money) and True
         everywhere else.
         """
+        eff, effort_note = self.resolve_effort_explained(effort, rank)
+        decision = self._decide(
+            eff=eff, rank=rank, specialty=specialty, mode=mode,
+            requested_provider=requested_provider, requested_model=requested_model,
+            allow_api_fallback=allow_api_fallback,
+        )
+        if effort_note:
+            decision.reason = f"{decision.reason}; {effort_note}" if decision.reason else effort_note
+        return decision
+
+    def _decide(
+        self,
+        eff: str,
+        rank: Optional[str] = None,
+        specialty: Optional[str] = None,
+        mode: str = "auto",
+        requested_provider: Optional[str] = None,
+        requested_model: Optional[str] = None,
+        allow_api_fallback: Optional[bool] = None,
+    ) -> PolicyDecision:
+        """The decision itself, on an already-resolved effort level."""
         mode = (mode or "auto").strip().lower()
-        eff = self.resolve_effort(effort, rank)
         if allow_api_fallback is None:
             allow_api_fallback = (mode != "local")
 

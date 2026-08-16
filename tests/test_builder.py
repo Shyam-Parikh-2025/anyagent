@@ -8,18 +8,19 @@ import json
 
 from llmadapt.builder import (
     DEFAULT_MODEL_MAP,
-    BuildResult,
     CompanySpec,
     EmployeeSpec,
     build_company,
     company_options,
     company_setup_schema,
     default_on_escalation,
+    make_company_via_gui,
+    quick_company,
     register_company_builder,
     set_company_up,
     set_up_company,
 )
-from llmadapt.company import Company, EscalationEvent
+from llmadapt.company import Company, EscalationEvent, always_approve
 from llmadapt.core import Agent, ToolRegistry
 from llmadapt.presets import ORG_TEMPLATES, TASK_SIZES, default_bundle
 from llmadapt.router import RoleRank
@@ -270,5 +271,50 @@ bundle.skills.register(Skill(name="private-skill", instructions="secret"))
 assert "private-skill" in company_options(bundle)["skills"]
 assert "private-skill" in company_setup_schema(bundle)["parameters"]["properties"]["employees_json"]["description"]
 print("PASS 31: a forked bundle's custom presets show up in the options and the schema")
+
+
+# ---------------------------------------------------------------------------
+# Layer 5: the terse paths - make_company_via_gui and quick_company
+# ---------------------------------------------------------------------------
+
+# make_company_via_gui is set_company_up(mode="gui", ...) under a name that
+# says what it does. Exercised non-blocking so this test doesn't need a
+# browser or a human clicking "Build" - the point being checked is that it
+# dispatches to the same server launch_gui()/set_company_up(mode="gui") does.
+server = make_company_via_gui(open_browser=False, block=False)
+assert server.url.startswith("http://127.0.0.1:")
+assert server.result is None
+server.shutdown()
+print("PASS 32: make_company_via_gui() launches the same node-graph editor server set_company_up(mode='gui') does")
+
+# quick_company: one call, a template name, a ready-to-use Company - and the
+# safe defaults are not weakened just because the call got shorter.
+company = quick_company("small-coding-team", name="Quick Co")
+assert isinstance(company, Company) and company.name == "Quick Co"
+assert set(company.employees) == {"Chief", "Manager", "Reviewer", "Developer"}
+assert len(company.teams) == 1 and company.teams[0].reviewer.name == "Reviewer"
+assert all(e.agent.provider == "ollama" for e in company.employees.values()), \
+    "no model_map given - quick_company must still default to local-only, same as build_company"
+assert company.on_escalation is default_on_escalation, \
+    "no on_escalation given - quick_company must still default to decline"
+assert company.budget.total_token_budget is None
+print("PASS 33: quick_company('small-coding-team') builds a ready-to-use Company without weakening any safe default")
+
+# **template_kwargs forwards to build_from_template - review_mode here.
+appended = quick_company("small-coding-team", name="Appended", review_mode="append")
+assert appended.teams[0].review_mode == "append"
+print("PASS 34: quick_company forwards extra keywords (e.g. review_mode) to build_from_template")
+
+# A caller who wants a real budget or a real escalation policy can still set
+# them in the same one call.
+capped = quick_company(
+    "solo", name="Capped", total_token_budget=1000,
+    on_escalation=always_approve(extra_token_budget=100),
+)
+assert capped.budget.total_token_budget == 1000
+assert capped.on_escalation(
+    EscalationEvent(kind="budget_exhausted", employee_name="Worker", rank="SENIOR", message="m")
+).approve is True
+print("PASS 35: quick_company still accepts a real total_token_budget and on_escalation when given")
 
 print("\nAll Phase 8 text/schema-mode checks passed.")

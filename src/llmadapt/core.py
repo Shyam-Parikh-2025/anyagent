@@ -1,14 +1,21 @@
-import os
 import json
 import inspect
+import logging
 import urllib.request
 import urllib.error
 import threading
 import asyncio
 import time
-from typing import get_type_hints, Callable
+import warnings
+from typing import get_type_hints, Any, Callable, Optional
 
-from .compressor import CompressionPolicy
+# escalation decision now defaults on Company itself (see
+# company/escalation.py's default_on_escalation) - Company(on_escalation=None)
+# falls back to it instead of requiring every caller to pass a callback.
+from .compressor import PIN_KEY, CompressionPolicy, ContextCompressor, HistoryCompactionPolicy
+from .env import resolve_api_key
+
+logger = logging.getLogger(__name__)
 
 
 class Conversation:
@@ -21,16 +28,31 @@ class Conversation:
     These providers should naturally work within the library.
     Custom Providers are possible to use but a function to specify the structure is required. """
     
-    def __init__(self, system_instruction: str = ""):
+    def __init__(self, system_instruction: str = "", archive=None):
         self.history = []
         self.system_instruction = system_instruction
         self.model_role = "assistant"
+        # An optional archive.RunArchive. None (the default) means nothing is
+        # written anywhere. Every message is archived as it is appended -
+        # write-through rather than at compaction time - so the file is the
+        # untouched transcript by construction, and a crash mid-run still
+        # leaves everything up to that point on disk. See archive.py.
+        self.archive = archive
 
         if self.system_instruction:
-            self.history.append({"role": "system", "content": self.system_instruction})
+            self._append({"role": "system", "content": self.system_instruction})
+
+    def _append(self, msg: dict):
+        """The single place a message enters history, so the archive cannot
+        miss one. Archiving first would risk recording a message that then
+        failed to be stored; archiving after keeps history authoritative and
+        the file a faithful shadow of it."""
+        self.history.append(msg)
+        if self.archive is not None:
+            self.archive.append("message", dict(msg), position=len(self.history) - 1)
 
     def add_user_msg(self, text: str):
-        self.history.append({"role": "user", "content": text})
+        self._append({"role": "user", "content": text})
     
     def add_model_msg(self, text: str = None, tool_calls: list = None, role: str = None,
                        native: dict = None, native_provider: str = None):
@@ -63,8 +85,62 @@ class Conversation:
         if native is not None:
             msg["_native"] = native
             msg["_native_provider"] = native_provider
-        self.history.append(msg)
+        self._append(msg)
     
+    # The marker HistoryCompactionPolicy honours. Leading underscore on purpose:
+    # export_for() already strips every "_"-prefixed key before a message goes
+    # over the wire (the same convention _native/_native_provider use), so a pin
+    # is bookkeeping this library can see and no provider ever will.
+    PIN_KEY = PIN_KEY
+
+    def pin(self, text: str, role: str = "user", reason: str = "") -> dict:
+        """Append a message that history compaction may never touch.
+
+        The conversation-side twin of Phase 7's ALWAYS_KEEP_KINDS. Until now the
+        only protected thing was a leading system message, which covers the
+        employee's identity and nothing else - so a spec, an API contract, a
+        decision made at turn 3 that everything after it depends on, all became
+        eligible to be summarized into "the user asked about the schema" once
+        the conversation grew.
+
+        Use it for facts whose loss changes the answers: constraints that must
+        hold, an interface the code has to match, a correction the model got
+        wrong once already. Not for bulk - a pinned message is by definition
+        never compacted, so pinning a large document means carrying it in full
+        for the rest of the run.
+        """
+        msg = {"role": role, "content": text, self.PIN_KEY: True}
+        if reason:
+            msg["_pin_reason"] = reason
+        self._append(msg)
+        return msg
+
+    def pin_last(self, reason: str = "") -> Optional[dict]:
+        """Pin the message already at the end of the history.
+
+        For pinning something that arrived normally - a model's answer worth
+        keeping verbatim, or a user turn that turned out to be load-bearing -
+        rather than adding a new message to say it again.
+        """
+        if not self.history:
+            return None
+        msg = self.history[-1]
+        msg[self.PIN_KEY] = True
+        if reason:
+            msg["_pin_reason"] = reason
+        return msg
+
+    def pinned(self) -> list:
+        """Every pinned message, in order. The leading system instruction is
+        included: it is protected by the same guarantee, just by a different
+        mechanism, and a caller asking "what survives compaction?" wants one
+        answer rather than two."""
+        out = []
+        if self.history and self.history[0].get("role") == "system":
+            out.append(self.history[0])
+        out.extend(m for m in self.history if m.get(self.PIN_KEY) and m not in out)
+        return out
+
     def add_tool_response(self, function_name: str, output: str, tool_call_id: str = None):
         msg = {
             "role": "tool",
@@ -73,7 +149,7 @@ class Conversation:
         }
         if tool_call_id:
             msg["tool_call_id"] = tool_call_id
-        self.history.append(msg)
+        self._append(msg)
 
     def export_for(self, provider: str, special_format: Callable[[list], list] = None) -> list:
         """Translates local flat memory frames into target external API layouts."""
@@ -213,6 +289,146 @@ class Conversation:
                 })
         return gemini_history
 
+def loop_local_lock(owner: Any, attr: str) -> "asyncio.Lock":
+    """An asyncio.Lock stored on `owner`, recreated whenever the running event
+    loop changes.
+
+    A lock cannot simply be built in `__init__` here. On Python 3.9 (the
+    floor this package supports) `asyncio.Lock()` binds to an event loop when
+    it is created, and every synchronous entry point in this library starts a
+    *fresh* loop via `asyncio.run()` - so a lock made at hire() time would
+    belong to a loop that no longer exists by the time anyone waits on it, and
+    would raise instead of guarding anything.
+
+    Rebinding per loop is not a weakening of the guarantee: a lock only ever
+    has to serialize coroutines running on the same loop, and two different
+    loops (a fresh `asyncio.run()` per sync call) cannot be running each
+    other's coroutines concurrently in the first place.
+
+    Must be called from inside a running loop, which every caller here is.
+    """
+    loop = asyncio.get_running_loop()
+    existing = getattr(owner, attr, None)
+    if existing is not None and existing[0] is loop:
+        return existing[1]
+    lock = asyncio.Lock()
+    setattr(owner, attr, (loop, lock))
+    return lock
+
+
+def run_coroutine_blocking(coro_factory: Callable[[], Any], what: str = "this call") -> Any:
+    """Runs a coroutine to completion from synchronous code, and survives
+    being called from inside somebody else's running event loop.
+
+    Every synchronous entry point in this library (`Agent.chat`,
+    `Company.run`, ...) is a thin wrapper over its async twin, so that there
+    is one implementation of each rather than two that drift. Plain
+    `asyncio.run()` would be enough - except that `asyncio.run()` raises
+    `RuntimeError: asyncio.run() cannot be called from a running event loop`
+    the moment somebody calls the sync API from inside an `async def`, which
+    is exactly what a FastAPI route handler doing `result = company.run(task)`
+    looks like. Letting that native error surface would make the simple sync
+    API unusable in the frameworks people most want to use it from.
+
+    So: if there is no loop running, `asyncio.run()`. If there is, warn loudly
+    and run the coroutine on a fresh thread, which has no loop of its own and
+    so may legally start one.
+
+    The warning is not decoration. The recovery produces a *correct result*
+    and nothing more: the caller's event loop stays blocked for the whole
+    duration anyway, because Python only hands control back to a loop at an
+    `await`, and no amount of cleverness in the callee can grant that on the
+    caller's behalf. The only real fix is at the call site, which is what the
+    warning says. Nothing here silently approves, retries or skips anything -
+    the coroutine runs exactly once, and its exceptions are re-raised.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro_factory())  # the ordinary case: no loop, no drama
+
+    warnings.warn(
+        f"{what} was called from inside a running event loop. It has been run on a helper "
+        f"thread and the result is correct, but your event loop stayed blocked for the whole "
+        f"call - only an `await` at your call site can hand control back to it, which a "
+        f"synchronous method cannot do for you. Use the async twin instead (e.g. "
+        f"`await company.run_async(task)` / `await agent.chat_async(text)`), or "
+        f"`await asyncio.to_thread(company.run, task)` if you must keep the sync call.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+    results: list = []
+    errors: list = []
+
+    def _runner():
+        try:
+            results.append(asyncio.run(coro_factory()))
+        except BaseException as e:  # noqa: BLE001 - re-raised on the calling thread below
+            errors.append(e)
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+    if errors:
+        raise errors[0]
+    return results[0]
+
+
+class ToolControlFlow(Exception):
+    """Base class for exceptions that must travel *through* a tool call
+    untouched, instead of being turned into a message for the model.
+
+    `ToolRegistry.execute()` deliberately converts any exception a tool raises
+    into a `"Tool Execution Failure (...)"` string, because a tool that
+    crashed is ordinarily something the model should see and work around -
+    that is the whole reason a bad argument doesn't kill a run.
+
+    A small number of exceptions are not that. They are not "this tool
+    failed", they are "this run must stop, or wait". The one that exists today
+    is `company.escalation.EscalationUnresolved`: a human was asked whether to
+    continue and said no. Because `delegate_to_<name>` is an ordinary tool
+    (Employee.delegate_tool), a decline raised inside a delegated employee
+    used to be caught by execute() and handed back to the *manager's* model as
+    a failed-tool string - so the manager read "that didn't work", tried
+    something else, and the run finished normally reporting success. The human
+    said stop and nothing stopped, which is the exact inversion of the
+    0-means-always-ask-a-human-first rule the budget and escalation systems are
+    built on.
+
+    Anything subclassing this is re-raised by execute() rather than
+    stringified. It is a base class rather than a hardcoded tuple of types
+    inside execute() so that core.py needs no import of the company layer (the
+    dependency arrow points one way, see company/employee.py's docstring), and
+    so a future "this run is paused waiting on a human" signal can opt in by
+    inheriting rather than by editing a list here.
+    """
+
+
+class RunPaused(ToolControlFlow):
+    """Raised when an escalation handler asks for the run to *wait* rather than
+    approving or declining - see company.escalation.ESCALATION_PENDING.
+
+    Lives here, next to ToolControlFlow, for the same reason that class does:
+    it has to escape `ToolRegistry.execute()` intact, and core.py must not
+    import the company layer to make that happen. It carries the escalation
+    event as an opaque attribute - core never inspects it.
+
+    What makes a pause resumable is not this exception, which only unwinds the
+    stack. It is that each Agent it passes through stores the turn it was in
+    the middle of (`Agent._pending_turn`): the provider response that asked for
+    the tools, and the outputs of the tool calls that had already finished.
+    Python cannot serialize a paused call stack, but it does not have to - a
+    turn is fully described by those two things, and a chain of delegations is
+    just a stack of turns, each one held by the Agent it belongs to.
+    """
+
+    def __init__(self, event: Any = None, task: Optional[str] = None):
+        self.event = event
+        self.task = task
+        super().__init__(f"run paused awaiting a decision on: {getattr(event, 'message', event)!r}")
+
+
 class ToolRegistry:
     """ Tool Registry Class:
     This class needs to handle tool storage and usage.
@@ -263,30 +479,87 @@ class ToolRegistry:
         self.functions_maps[func_name] = python_function
         self.schemas[func_name] = schema 
     
+    def _prepare_args(self, name: str, args) -> tuple:
+        """Normalizes a provider's raw argument payload into kwargs.
+
+        Returns (kwargs, None) or (None, error_string). Split out of execute()
+        so the sync and async dispatch paths share one definition of what a
+        provider is allowed to send - two copies of this coercion is exactly
+        how a model's odd-but-tolerated argument shape starts working on one
+        path and failing on the other.
+        """
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                # Auto-wrap single primitive string inputs into standard key payload
+                sig = inspect.signature(self.functions_maps[name])
+                params = list(sig.parameters.keys())
+                if len(params) == 1:
+                    args = {params[0]: args}
+
+        if not isinstance(args, dict):
+            return None, f"Error: Arguments for tool '{name}' must be passed as a dictionary."
+        return args, None
+
+    @staticmethod
+    def _failure_text(e: BaseException) -> str:
+        """The one wording for 'your tool call blew up', shared by both paths."""
+        return (f"Tool Execution Failure ({e.__class__.__name__}): {str(e)}. "
+                f"Please adjust your input arguments.")
+
     def execute(self, name: str, args: dict) -> str:
         """Invokes a registered tool, safely converting crashes into explicit textual logs."""
         if name not in self.functions_maps:
             return f"Error: Tool '{name}' is not registered in this system."
-            
+
         try:
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    # Auto-wrap single primitive string inputs into standard key payload
-                    sig = inspect.signature(self.functions_maps[name])
-                    params = list(sig.parameters.keys())
-                    if len(params) == 1:
-                        args = {params[0]: args}
-
-            if not isinstance(args, dict):
-                return f"Error: Arguments for tool '{name}' must be passed as a dictionary."
-
-            res = self.functions_maps[name](**args)
+            kwargs, error = self._prepare_args(name, args)
+            if error is not None:
+                return error
+            res = self.functions_maps[name](**kwargs)
             return self._stringify_tool_output(res)
+        except ToolControlFlow:
+            # Not a tool failure - a signal about the run itself. Must reach
+            # the caller intact instead of becoming text for the model. See
+            # ToolControlFlow's docstring for what happened when it didn't.
+            raise
         except Exception as e:
-            error_type = e.__class__.__name__
-            return f"Tool Execution Failure ({error_type}): {str(e)}. Please adjust your input arguments."
+            return self._failure_text(e)
+
+    async def execute_async(self, name: str, args: dict) -> str:
+        """The awaitable form of execute(), with the same contract: returns a
+        string for every ordinary outcome, re-raises ToolControlFlow.
+
+        A tool defined with `async def` is awaited directly. An ordinary
+        synchronous tool - which is every tool anyone has written against this
+        library so far, `delegate_to_<name>` included - is run through
+        `asyncio.to_thread`, because calling it inline would block the event
+        loop for its whole duration and defeat the point of being here.
+
+        Running sync tools on a worker thread has a second, load-bearing
+        effect: a worker thread has no event loop of its own, so a sync tool
+        that internally calls back into `Agent.chat()` (again, this is exactly
+        what `delegate_to_<name>` does) gets a clean `asyncio.run()` rather
+        than tripping the nested-loop fallback on every single delegation.
+        """
+        if name not in self.functions_maps:
+            return f"Error: Tool '{name}' is not registered in this system."
+
+        func = self.functions_maps[name]
+        if not inspect.iscoroutinefunction(func):
+            return await asyncio.to_thread(self.execute, name, args)
+
+        try:
+            kwargs, error = self._prepare_args(name, args)
+            if error is not None:
+                return error
+            res = await func(**kwargs)
+            return self._stringify_tool_output(res)
+        except ToolControlFlow:
+            raise
+        except Exception as e:
+            return self._failure_text(e)
 
     def export_for(self, provider: str, special_format: Callable[[list], list] = None) -> list:
         if not self.schemas:
@@ -331,15 +604,31 @@ class Agent:
         "ollama": "llama3.1:8b"
     }
 
-    def __init__(self, provider: str, model: str = None, base_url: str = None,
-                 api_key: str = None, is_local: bool = False, system_instruction: str = "", max_tool_iterations: int = 6,
-                 max_tokens: int = None, compression_policy: CompressionPolicy = None):
-        self.conversation = Conversation(system_instruction=system_instruction)
+    def __init__(self, provider: str, model: Optional[str] = None, base_url: Optional[str] = None,
+                 api_key: Optional[str] = None, is_local: bool = False, system_instruction: str = "",
+                 max_tool_iterations: int = 6,
+                 max_tokens: Optional[int] = None, compression_policy: Optional[CompressionPolicy] = None,
+                 history_compaction: Optional[HistoryCompactionPolicy] = None,
+                 archive: Optional[Any] = None,
+                 key_alias: Optional[str] = None, key_env: Optional[str] = None,
+                 max_context_tokens: Optional[int] = None):
+        self.archive = archive
+        self.conversation = Conversation(system_instruction=system_instruction, archive=archive)
         self.tool_registry = ToolRegistry()
-        self.change_api(provider=provider, model=model, base_url=base_url, api_key=api_key)
+        self.change_api(provider=provider, model=model, base_url=base_url, api_key=api_key,
+                        key_alias=key_alias, key_env=key_env)
         self.set_max_tool_iterations(max_tool_iterations)
         self.max_tokens = max_tokens
         self.thinking_stage = "initial state"
+
+        # A separate concept from max_tokens (the per-request *output* cap
+        # sent to the provider): this is a whole-conversation budget tracked
+        # via tokens_used()/tokens_left(), set here or later through
+        # set_max_context_tokens(). None (the default) means no budget to
+        # count down from - tokens_left() then returns None rather than a
+        # number that would imply one.
+        self.max_context_tokens: Optional[int] = None
+        self.set_max_context_tokens(max_context_tokens)
 
         self.is_local = is_local
 
@@ -349,6 +638,18 @@ class Agent:
         # the agent owning/constructing a compressor instance.
         self.compression_policy = compression_policy or CompressionPolicy()
 
+        # The other half of "installing the compressor on an agent".
+        # CompressionPolicy shrinks one tool result; this compacts the
+        # conversation as a whole once it has outgrown its trigger.
+        #
+        # This class was written alongside CompressionPolicy and then never
+        # wired to anything - it had no call site anywhere in the library and
+        # was not even exported, so history compaction was a feature you had
+        # to reach into compressor.py and drive yourself. It is a real option
+        # now, and None still means "never touch history", so an Agent built
+        # the old way behaves exactly as it did.
+        self.history_compaction = history_compaction
+
         # Real per-provider usage, captured from each response as it comes back
         # (see _extract_usage/_record_usage) - not estimated. company.py's budget
         # governance (budget.py) reads total_tokens_used directly; usage_log keeps
@@ -356,12 +657,96 @@ class Agent:
         self.total_tokens_used = 0
         self.usage_log = []
 
+        # Pause/resume bookkeeping. `_pending_turn` is the one durable piece:
+        # {"response": <the raw provider response that asked for tools>,
+        #  "completed": {"<index>": "<already-finished tool output>"}}, set when
+        # a RunPaused unwinds through this agent and cleared when the turn is
+        # picked back up. It is plain JSON-able data on purpose - state.py
+        # carries it, which is what lets a run resume in a different process.
+        # The other two are scratch, alive only within one turn.
+        self._pending_turn: Optional[dict] = None
+        self._replay_results: Optional[dict] = None
+        self._partial_results: dict = {}
+
+        # How many of one turn's tool calls may be in flight at once. A model
+        # is free to ask for twenty tools in a single turn, and with delegation
+        # wired as an ordinary tool that can mean twenty employees starting
+        # work simultaneously - twenty provider requests, twenty conversations
+        # growing, twenty charges against the budget, all before anything comes
+        # back. A cap turns that into a queue.
+        #
+        # 8 rather than "unlimited" because unlimited is not actually a policy,
+        # it just borrows one from somewhere else: sync tools run on asyncio's
+        # default thread pool, which caps at min(32, cpu_count + 4), so an
+        # uncapped fan-out silently inherits a limit that depends on the
+        # machine it runs on. A number here is a decision; that was an
+        # accident. Set it higher when the work really is I/O-bound and the
+        # provider can take it, or None/0 for genuinely no cap.
+        self.max_parallel_tools: Optional[int] = 8
+
     def reset_usage(self):
         """Zeroes the usage counters. Useful for a long-lived Agent being
         reused across many separate tasks where each task's cost should be
         measured independently."""
         self.total_tokens_used = 0
         self.usage_log = []
+
+    def set_max_context_tokens(self, max_context_tokens: Optional[int]) -> "Agent":
+        """Sets (or clears, with None) the whole-conversation token budget
+        that tokens_left() counts down from.
+
+        Deliberately a separate knob from max_tokens: max_tokens is the
+        per-request *output* cap sent to the provider (Anthropic's
+        max_tokens, Gemini's maxOutputTokens, ...), while max_context_tokens
+        is a budget you track the whole conversation against, checked with
+        tokens_used()/tokens_left() rather than enforced by the provider.
+        """
+        if max_context_tokens is not None:
+            if not isinstance(max_context_tokens, int) or isinstance(max_context_tokens, bool) or max_context_tokens < 0:
+                raise ValueError("max_context_tokens must be a non-negative integer, or None")
+        self.max_context_tokens = max_context_tokens
+        return self
+
+    def tokens_used(self) -> int:
+        """Estimated tokens the next request would cost: system instruction +
+        conversation history + registered tool schemas, added up with
+        ContextCompressor.token_estimate - the same no-external-tokenizer
+        heuristic CompressionPolicy uses. This is an estimate, not an exact
+        provider count (no external tokenizer is used anywhere in this
+        library, on purpose - see compressor.py) - treat it as a
+        budget-tracking signal, not a billing figure.
+        """
+        total = 0
+        system_instruction = self.conversation.system_instruction
+        if system_instruction:
+            total += ContextCompressor.token_estimate(system_instruction)
+
+        for msg in self.conversation.history:
+            content = msg.get("content")
+            if isinstance(content, str):
+                total += ContextCompressor.token_estimate(content)
+            elif content is not None:
+                # A structured/native content block (e.g. a provider-native
+                # tool-use block) - stringify it so it still counts for
+                # something, rather than being silently skipped.
+                total += ContextCompressor.token_estimate(json.dumps(content, default=str))
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                total += ContextCompressor.token_estimate(json.dumps(tool_calls, default=str))
+
+        if self.tool_registry.schemas:
+            schema_text = json.dumps(list(self.tool_registry.schemas.values()), default=str)
+            total += ContextCompressor.token_estimate(schema_text)
+
+        return total
+
+    def tokens_left(self) -> Optional[int]:
+        """max_context_tokens - tokens_used(), floored at 0. Returns None if
+        no max_context_tokens budget is set - there is nothing to count down
+        from."""
+        if self.max_context_tokens is None:
+            return None
+        return max(0, self.max_context_tokens - self.tokens_used())
 
     def _extract_usage(self, res: dict) -> dict:
         """Pulls real input/output token counts out of a raw provider
@@ -411,17 +796,73 @@ class Agent:
         else:
             print(f"[{self.provider.upper()}] ➔ {stage}...", end="\n", flush=True)
 
+    def pin_context(self, text: str, reason: str = "") -> dict:
+        """Add a fact this agent must not lose to compaction. See
+        Conversation.pin for what belongs here and what doesn't."""
+        return self.conversation.pin(text, reason=reason)
+
+    def pin_last(self, reason: str = ""):
+        """Protect the most recent message from compaction."""
+        return self.conversation.pin_last(reason=reason)
+
+    def _maybe_compact_history(self):
+        """Run the history compaction policy, if one is set, before building a
+        request.
+
+        At the top of generate() rather than inside the tool loop: compaction
+        is threshold-triggered, and re-running it after every tool iteration
+        would mean paying for it (a summarizer call, in mode="agent") several
+        times inside one turn for no extra benefit.
+
+        Assigns in place, exactly as compaction.compact_company() does and for
+        the same reason - anything holding a reference to conversation.history
+        must not be left pointing at a stale list.
+        """
+        policy = self.history_compaction
+        if policy is None or getattr(policy, "mode", "off") == "off":
+            return
+        before = len(self.conversation.history)
+        try:
+            compacted = policy.compact(self.conversation.history)
+        except Exception as e:
+            # Same contract as mode="agent" falling back to algorithmic: a
+            # compaction failure must never be a way to break a run. The
+            # untouched history is still perfectly usable, just larger.
+            logger.warning("history compaction failed (%r) - continuing uncompacted", e)
+            return
+        if compacted is self.conversation.history or len(compacted) == before:
+            return
+        self.conversation.history[:] = compacted
+        if self.archive is not None:
+            # The transcript itself is already archived message-by-message as
+            # it was written, so this records only that a lossy step happened
+            # and how much it removed - enough to line the live history up
+            # against the archived one afterwards.
+            self.archive.append("history_compacted", messages_before=before,
+                                messages_after=len(compacted), mode=getattr(policy, "mode", "?"))
+
     def set_max_tool_iterations(self, n: int):
         """Sets the upper threshold for consecutive tool execution cycles."""
         if not isinstance(n, int) or n < 1:
             raise ValueError("max_tool_iterations must be an integer >= 1")
         self.max_tool_iterations = n
 
-    def change_api(self, provider: str, model: str = None, base_url: str = None, api_key: str = None):
-        """Re-routes active transport endpoints with fluent default model fallbacks."""
+    def change_api(self, provider: str, model: Optional[str] = None, base_url: Optional[str] = None,
+                    api_key: Optional[str] = None,
+                    key_alias: Optional[str] = None, key_env: Optional[str] = None):
+        """Re-routes active transport endpoints with fluent default model fallbacks.
+
+        key_alias/key_env steer where a missing api_key is looked up - see
+        env.resolve_api_key for the full order. They matter when several
+        endpoints share a provider *protocol* but not an account: OpenRouter,
+        Together, Groq and a local vLLM are all provider="openai" to this
+        transport, and OPENAI_API_KEY is the wrong key for every one of them.
+        """
         self.provider = provider.lower()
         self.model = model or self.DEFAULT_MODELS.get(self.provider, "custom-model")
         self.api_key = api_key
+        self.key_alias = key_alias
+        self.key_env = key_env
 
         if base_url:
             self.url = base_url
@@ -436,8 +877,24 @@ class Agent:
         else:
             self.url = ""
 
-        if not self.api_key and self.provider != "ollama":
-            self.api_key = os.getenv(f"{self.provider.upper()}_API_KEY")
+        # A local provider needs no key, so don't go looking for one and don't
+        # report its absence as a problem.
+        if self.provider == "ollama":
+            self.api_key_source = "passed explicitly" if self.api_key else "not needed (local provider)"
+        else:
+            self.api_key, self.api_key_source = resolve_api_key(
+                provider=self.provider, explicit=self.api_key,
+                alias=key_alias, key_env=key_env,
+            )
+            if not self.api_key:
+                # Warn, never raise. The endpoint may be a local one behind a
+                # base_url that needs no key, and an Agent that refuses to be
+                # constructed gives a worse error than the provider's own 401 -
+                # which at least proves the request was attempted. The message
+                # names every variable that was tried, because "no key" without
+                # that list tells you nothing about what to set.
+                logger.warning("Agent(provider=%r, model=%r): no API key - %s",
+                                self.provider, self.model, self.api_key_source)
 
     def add_tool(self, python_function: Callable, schema: dict = None):
         self.tool_registry.register(python_function, schema)
@@ -458,66 +915,38 @@ class Agent:
         except urllib.error.URLError as e:
             raise RuntimeError(f"\n[Network Unreachable]: Check route {self.url}. Reason: {e.reason}")
 
-    def _execute_with_thread(self, func: Callable, error_container: list, results_container: list, *args, **kwargs):
-        """Executes any worker function in a separate thread and safely collects its outputs or crashes."""
-        
-        def worker():
-            """Internal closure block that catches target output signatures."""
-            try:
-                # Execute the actual target function with passed arguments
-                res = func(*args, **kwargs)
-                results_container.append(res)
-            except Exception as e:
-                # Capture target code crashes (like HTTP errors) so the main thread knows about them
-                error_container.append(e)
-
-        thread = threading.Thread(target=worker)
-        thread.daemon = True
-        thread.start()
-        
-        return thread
-            
-
     def chat(self, user_input: str, custom_format_func: Callable[[list], list] = None, max_tokens: int = None,
              thinking_visible: bool = True, spinner: bool = True) -> str:
-        self.conversation.add_user_msg(user_input)
-        
-        return self.generate(custom_format_func, max_tokens=max_tokens, thinking_visible=thinking_visible)
+        """The synchronous entry point, unchanged for every caller that isn't
+        writing async code: hand it a string, get a string back, no event loop
+        required anywhere in sight.
 
-    def generate(self, custom_format_func: Callable[[list], list] = None, max_tokens: int = None, 
+        It is now a wrapper over chat_async() rather than a second
+        implementation. There used to be two near-identical request loops here
+        - `generate` and `generate_async` differed only in how they made the
+        HTTP call - and the library already treats that kind of duplication as
+        a bug waiting to happen (see ReviewMode's history in company/team.py).
+        One of them had to become the real one, and async is the only choice
+        that can host the other: `asyncio.run()` can drive a coroutine, but no
+        synchronous function can host an `await`.
+        """
+        return run_coroutine_blocking(
+            lambda: self.chat_async(user_input, custom_format_func, max_tokens=max_tokens,
+                                    thinking_visible=thinking_visible, spinner=spinner),
+            what="Agent.chat()",
+        )
+
+    def generate(self, custom_format_func: Callable[[list], list] = None, max_tokens: int = None,
                  thinking_visible: bool = True, spinner: bool = True) -> str:
-        """Generate response based on the current conversation and tools."""
-        max_tokens = max_tokens if max_tokens is not None else self.max_tokens
-        self._update_stage("initial state", thinking_visible=thinking_visible)
-        
-        iterations = 0 
-        while True:
-            iterations += 1
-            if iterations > self.max_tool_iterations:
-                raise RuntimeError(f"Exceeded max_tool_iterations ({self.max_tool_iterations})")
+        """Generate a response from the current conversation and tools.
 
-            history = self.conversation.export_for(self.provider, special_format=custom_format_func)
-            tools = self.tool_registry.export_for(self.provider, special_format=custom_format_func)
-            headers = {"Content-Type": "application/json"}
-
-            # --- 1. COMPILE THE TARGET PAYLOAD ---
-            payload = self.gen_payload(history, tools, headers, max_tokens)
-
-            # --- 2. SEND THE REQUEST ---
-            self._update_stage("Request sent to AI", f"Payload Size: {len(history)} turns", thinking_visible=thinking_visible)
-            errors, results = [], []            
-            thread = self._execute_with_thread(self._send_request, errors, results, payload, headers)
-            self.spinner(spinner, thinking_visible, thread)
-
-            # Check if the background thread threw a network exception
-            if errors: raise errors[0]
-            # Unpack the completed parsed json data dictionary
-            res = results[0]
-
-            # --- 3. PROCESS COMPLETED RESPONSE OBJECTS ---
-            output = self.process_response(res, thinking_visible=thinking_visible)
-            if output is not None: return output
-            continue # continue to the next iteration - left in case of changes later
+        Synchronous wrapper over generate_async() - see chat() for why this
+        direction and not the other."""
+        return run_coroutine_blocking(
+            lambda: self.generate_async(custom_format_func, max_tokens=max_tokens,
+                                        thinking_visible=thinking_visible, spinner=spinner),
+            what="Agent.generate()",
+        )
 
     # Helper methods for generating payloads
     def gen_payload(self, history, tools, headers, max_tokens: int):
@@ -575,32 +1004,140 @@ class Agent:
         return payload
     
     # Helper method for processing completed responses
-    def process_response(self, res, thinking_visible=False):
+    def _run_tool_calls(self, calls, thinking_visible=False) -> list:
+        """Runs one turn's tool calls and returns their finished output
+        strings, positionally aligned with `calls`.
+
+        `calls` is the provider-neutral shape every process_*_response method
+        normalizes to before dispatching: a list of
+        {"id": str|None, "name": str, "args": dict|str}. Each provider parses
+        its own response into that shape and writes the results back in its
+        own format; what happens in between - invoke, compress, keep the
+        stages narrated - is identical for all four, and this is now the only
+        place it is written.
+
+        It used to be written four times, once inside each process_*_response
+        method. That is the same duplication REVIEW_MODES had before it was
+        collapsed (see company/team.py), and it was about to get worse rather
+        than better: parallel tool execution and resumable escalations both
+        need to change exactly this step, and changing it in four places twice
+        over is how the four copies start disagreeing.
+
+        Deliberately sequential, exactly as before - this refactor is a
+        no-behaviour-change move, and turning the loop into an
+        `asyncio.gather` is the next phase's job, not this one's. It is a
+        separate method precisely so that becomes a one-place change.
+        """
+    async def _run_tool_calls(self, calls, thinking_visible=False) -> list:
+        """Runs a turn's tool calls concurrently and returns their outputs in
+        call order.
+
+        This is the line that makes a delegation hierarchy worth having. A
+        manager splitting work three ways emits three tool calls in one turn;
+        run one after another they cost the sum of three round-trips, and the
+        two reports not currently being waited on sit idle. Here they cost the
+        slowest one.
+
+        `return_exceptions=True` is not politeness, it is the difference
+        between a sibling failing and a sibling being abandoned: without it,
+        gather propagates the first exception immediately while the other
+        coroutines are still running, and their results - including any work
+        already charged to the budget - are dropped on the floor with nobody
+        waiting on them. With it, everyone finishes and then the failures are
+        dealt with:
+
+        - a ToolControlFlow (an escalation a human declined, and later a
+          pause) is re-raised, because it is a statement about the run rather
+          than about one tool, and the run is what has to stop;
+        - anything else becomes the same "Tool Execution Failure" string a
+          crash inside execute_async() would have produced, so one bad tool
+          call is something the model can see and work around, exactly as it
+          was when these ran one at a time.
+
+        Ordering is unaffected: gather returns results in the order the
+        coroutines were passed, not the order they finished, so writing them
+        back against `calls` stays correct.
+        """
+        replay = self._replay_results or {}
+        limit = self.max_parallel_tools
+        gate = asyncio.Semaphore(limit) if limit and limit > 0 else None
+
+        async def _one(index, call):
+            # A result carried over from before a pause is returned as-is and
+            # the tool is NOT run again. That is the whole point of recording
+            # it: the sibling calls that completed before somebody asked for a
+            # human already had their effects, and re-running them on resume
+            # would repeat those effects - a second delegation, a second write,
+            # a second charge against the budget.
+            if str(index) in replay:
+                return replay[str(index)]
+            if gate is None:
+                return await _invoke(call)
+            async with gate:
+                return await _invoke(call)
+
+        async def _invoke(call):
+            self._update_stage("Running Tool Local Process", f"Invoking function '{call['name']}'",
+                               thinking_visible=thinking_visible)
+            out = await self.tool_registry.execute_async(call["name"], call["args"])
+            return self.compression_policy.compress(out)
+
+        raw = await asyncio.gather(*(_one(i, call) for i, call in enumerate(calls)),
+                                   return_exceptions=True)
+
+        control_flow = next((r for r in raw if isinstance(r, ToolControlFlow)), None)
+        if control_flow is not None:
+            if isinstance(control_flow, RunPaused):
+                # Hand the caller everything that DID finish, keyed by position
+                # rather than by tool-call id: gemini and ollama can both omit
+                # ids, and the index is stable because the very same provider
+                # response is what gets replayed.
+                #
+                # Only successes are recorded. If two calls paused at once -
+                # perfectly possible now that they run concurrently - one pause
+                # is surfaced and the other simply is not marked finished, so on
+                # resume it runs again and asks again. That is one extra
+                # question for a human rather than one unanswered question
+                # treated as answered, which is the right way round for the one
+                # mechanism in this library whose entire job is to stop and ask.
+                self._partial_results = {
+                    str(i): out for i, out in enumerate(raw) if isinstance(out, str)
+                }
+            raise control_flow
+
+        results = []
+        for out in raw:
+            if isinstance(out, BaseException):
+                out = self.compression_policy.compress(ToolRegistry._failure_text(out))
+            results.append(out)
+        return results
+
+    async def process_response(self, res, thinking_visible=False):
         self._record_usage(res)  # every provider path funnels through here, sync or async
 
         if self.provider == "gemini":
-            output = self.process_gemini_response(res, thinking_visible=thinking_visible)
+            output = await self.process_gemini_response(res, thinking_visible=thinking_visible)
             if output is not None: return output
             return None
         
         elif self.provider == "anthropic":
-            output = self.process_anthropic_response(res, thinking_visible=thinking_visible)
+            output = await self.process_anthropic_response(res, thinking_visible=thinking_visible)
             if output is not None: return output
             return None
 
         elif self.provider in ["openai", "custom"]:
-            output = self.process_openai_custom_response(res, thinking_visible=thinking_visible)
+            output = await self.process_openai_custom_response(res, thinking_visible=thinking_visible)
             if output is not None: return output
             return None
 
         elif self.provider == "ollama":
-            output = self.process_ollama_response(res, thinking_visible=thinking_visible)
+            output = await self.process_ollama_response(res, thinking_visible=thinking_visible)
             if output is not None: return output
             return None
         else:
             raise ValueError(f"Unsupported provider: {self.provider}. Please review how to configure custom providers.")
 
-    def process_gemini_response(self, res, thinking_visible=False):
+    async def process_gemini_response(self, res, thinking_visible=False):
         if 'candidates' not in res or not res['candidates']:
             error_msg = res.get('error', {}).get('message', 'Unknown Gemini API Error')
             raise RuntimeError(f"Gemini API empty response or error: {error_msg}")
@@ -620,14 +1157,12 @@ class Agent:
                 native={"role": "model", "parts": parts},
                 native_provider="gemini"
             )
-            for function_call in function_calls:
-                name, args = function_call['name'], function_call.get('args', {})
-                call_id = function_call.get("id", "")
-                
-                self._update_stage("Running Tool Local Process", f"Invoking function '{name}'", thinking_visible=thinking_visible)
-                out_str = self.tool_registry.execute(name, args)
-                out_str = self.compression_policy.compress(out_str)
+            calls = [{"id": fc.get("id", ""), "name": fc["name"], "args": fc.get("args", {})}
+                     for fc in function_calls]
+            outputs = await self._run_tool_calls(calls, thinking_visible=thinking_visible)
 
+            for call, out_str in zip(calls, outputs):
+                name, call_id = call["name"], call["id"]
                 function_response = {"name": name, "response": {"result": out_str}}
                 if call_id: function_response["id"] = call_id
                 self.conversation.history.append({
@@ -643,7 +1178,7 @@ class Agent:
         self._update_stage("Success", thinking_visible=thinking_visible)
         return text
 
-    def process_anthropic_response(self, res, thinking_visible=False):
+    async def process_anthropic_response(self, res, thinking_visible=False):
         t_calls, final_text = [], ""
         for block in res.get("content", []):
             if block["type"] == "text": final_text += block["text"]
@@ -656,13 +1191,14 @@ class Agent:
                 text=final_text if final_text else None, tool_calls=t_calls,
                 native={"role": "assistant", "content": res.get("content", [])}, native_provider="anthropic"
             )
-            tool_result_blocks = []
-            for tc in t_calls:
-                self._update_stage("Running Tool Local Process", f"Invoking function '{tc['function']['name']}'", thinking_visible=thinking_visible)
-                out_str = self.tool_registry.execute(tc["function"]["name"], tc["function"]["arguments"])
-                out_str = self.compression_policy.compress(out_str)
-                tool_result_blocks.append({"type": "tool_result", "tool_use_id": tc["id"], "content": out_str})
-            
+            calls = [{"id": tc["id"], "name": tc["function"]["name"], "args": tc["function"]["arguments"]}
+                     for tc in t_calls]
+            outputs = await self._run_tool_calls(calls, thinking_visible=thinking_visible)
+            tool_result_blocks = [
+                {"type": "tool_result", "tool_use_id": call["id"], "content": out_str}
+                for call, out_str in zip(calls, outputs)
+            ]
+
             native_user_msg = {"role": "user", "content": tool_result_blocks}
             for tc, block in zip(t_calls, tool_result_blocks):
                 self.conversation.history.append({
@@ -676,7 +1212,7 @@ class Agent:
         self._update_stage("Success", thinking_visible=thinking_visible)
         return final_text
 
-    def process_openai_custom_response(self, res, thinking_visible=False):
+    async def process_openai_custom_response(self, res, thinking_visible=False):
         if not res.get('choices'):
             error_msg = res.get('error', {}).get('message', 'Unknown OpenAI API Error') \
                 if isinstance(res.get('error'), dict) else str(res.get('error', 'Unknown OpenAI API Error'))
@@ -685,15 +1221,28 @@ class Agent:
         msg = res['choices'][0]['message']
         if msg.get("tool_calls"):
             self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in msg["tool_calls"]]), thinking_visible=thinking_visible)
+            # Handed the provider's raw tool_calls, exactly as before -
+            # add_model_msg does its own normalization (and its own JSON
+            # decoding of string arguments) on the way into history. The
+            # dispatch list built below is a separate, deliberately
+            # provider-neutral shape and must not be substituted here.
             self.conversation.add_model_msg(text=msg.get("content"), tool_calls=msg["tool_calls"])
-            for tool_call in msg["tool_calls"]:
-                name = tool_call["function"]["name"]
-                args = json.loads(tool_call["function"]["arguments"]) if isinstance(tool_call["function"]["arguments"], str) else tool_call["function"]["arguments"]
-                
-                self._update_stage("Running Tool Local Process", f"Invoking function '{name}'", thinking_visible=thinking_visible)
-                out_str = self.tool_registry.execute(name, args)
-                out_str = self.compression_policy.compress(out_str)
-                self.conversation.add_tool_response(name, out_str, tool_call["id"])
+            # One deliberate difference from the pre-refactor loop: arguments
+            # are decoded for every call up front, so a provider sending
+            # malformed JSON fails before any tool in the turn has run rather
+            # than half way through it. Both versions end the run with a
+            # JSONDecodeError; this one does it without leaving side effects
+            # from the calls that already went through.
+            calls = [{
+                "id": tc["id"],
+                "name": tc["function"]["name"],
+                "args": (json.loads(tc["function"]["arguments"])
+                         if isinstance(tc["function"]["arguments"], str)
+                         else tc["function"]["arguments"]),
+            } for tc in msg["tool_calls"]]
+            outputs = await self._run_tool_calls(calls, thinking_visible=thinking_visible)
+            for call, out_str in zip(calls, outputs):
+                self.conversation.add_tool_response(call["name"], out_str, call["id"])
             self._update_stage("Tool results sent to AI", thinking_visible=thinking_visible)
             return None
         
@@ -702,7 +1251,7 @@ class Agent:
         self._update_stage("Success", thinking_visible=thinking_visible)
         return text    
 
-    def process_ollama_response(self, res, thinking_visible=False):
+    async def process_ollama_response(self, res, thinking_visible=False):
         msg = res.get("message", {})
         if msg.get("tool_calls"):
             self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in msg["tool_calls"]]), thinking_visible=thinking_visible)
@@ -721,12 +1270,11 @@ class Agent:
                 })
 
             self.conversation.add_model_msg(text=msg.get("content"), tool_calls=sanitized_calls)
-            for tc in sanitized_calls:
-                name, args = tc["function"]["name"], tc["function"]["arguments"]
-                self._update_stage("Running Tool Local Process", f"Invoking function '{name}'", thinking_visible=thinking_visible)
-                out_str = self.tool_registry.execute(name, args)
-                out_str = self.compression_policy.compress(out_str)
-                self.conversation.add_tool_response(name, out_str, tc.get("id"))
+            calls = [{"id": tc.get("id"), "name": tc["function"]["name"], "args": tc["function"]["arguments"]}
+                     for tc in sanitized_calls]
+            outputs = await self._run_tool_calls(calls, thinking_visible=thinking_visible)
+            for call, out_str in zip(calls, outputs):
+                self.conversation.add_tool_response(call["name"], out_str, call["id"])
             self._update_stage("Tool results sent to AI", thinking_visible=thinking_visible)
             return None
         
@@ -755,6 +1303,22 @@ class Agent:
         self.compression_policy = policy
         return self
 
+    def set_max_parallel_tools(self, limit: Optional[int]) -> "Agent":
+        """How many of a single turn's tool calls may run at once.
+
+        Defaults to 8. `None` or 0 means no cap from this library - note that
+        does not mean no cap at all, since synchronous tools still queue on
+        asyncio's default thread pool (min(32, cpu_count + 4) workers), so
+        "unlimited" quietly becomes "whatever this machine allows". Prefer
+        naming a number.
+
+        Raise it when the tools are I/O-bound and the far end can take the
+        load; lower it to 1 to get the old strictly-sequential behaviour back
+        without giving up any of the async machinery.
+        """
+        self.max_parallel_tools = limit
+        return self
+
     def set_iterations(self, max_iterations: int) -> "Agent":
         """Chainable method to set tool execution limits."""
         self.set_max_tool_iterations(max_iterations)
@@ -764,23 +1328,6 @@ class Agent:
         """Chainable method to register a tool."""
         self.add_tool(func, schema)
         return self
-
-    def spinner(self, spinner, thinking_visible, thread):
-        # Keep the main thread alive to animate a spinner while waiting for network bytes
-            spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-            spinner_idx = 0
-
-            while thread.is_alive():
-                if spinner:
-                    print(f"\r[{self.provider.upper()}] ➔ Thinking {spinner_frames[spinner_idx]} ", end="", flush=True)
-                    spinner_idx = (spinner_idx + 1) % len(spinner_frames)
-                    time.sleep(0.08)
-                else:
-                    thread.join(timeout=0.1)  # Wait briefly to avoid busy-waiting
-                    #self._update_stage(f"\r[{self.provider.upper()}] ➔ Thinking", thinking_visible=thinking_visible)
-            
-            # Clear the spinner trace line cleanly from the console terminal line
-            print("\r" + " " * 50 + "\r", end="", flush=True)
 
     async def _animate_spinner(self, thinking_visible: bool):
         """Asynchronous terminal spinner running on the asyncio event loop."""
@@ -798,15 +1345,26 @@ class Agent:
 
     async def chat_async(self, user_input: str, custom_format_func: Callable[[list], list] = None, max_tokens: int = None,
                  thinking_visible: bool = True, spinner: bool = True) -> str:
-            self.conversation.add_user_msg(user_input)
-            
-            return await self.generate_async(custom_format_func, max_tokens=max_tokens, thinking_visible=thinking_visible)
+            # Resuming a paused run re-enters this agent through exactly the
+            # call that paused it, carrying the same task text. The turn it was
+            # in the middle of is still recorded, so this is a continuation, not
+            # a new question - adding the user message again would put a
+            # duplicate in the history and ask the model to start over.
+            if self._pending_turn is None:
+                self.conversation.add_user_msg(user_input)
+
+            return await self.generate_async(custom_format_func, max_tokens=max_tokens,
+                                             thinking_visible=thinking_visible, spinner=spinner)
     
     async def generate_async(
         self, custom_format_func: Callable[[list], list] = None, 
         max_tokens: int = None, thinking_visible: bool = True, 
         spinner: bool = True) -> str:
         max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        # Off the loop: in mode="agent" this makes a full summarizer round-trip,
+        # and doing that inline would stall every other coroutine sharing the loop
+        # for the length of an LLM call.
+        await asyncio.to_thread(self._maybe_compact_history)
         self._update_stage("initial state", thinking_visible=thinking_visible)
         
         iterations = 0 
@@ -815,46 +1373,78 @@ class Agent:
             if iterations > self.max_tool_iterations:
                 raise RuntimeError(f"Exceeded max_tool_iterations ({self.max_tool_iterations})")
 
-            history = self.conversation.export_for(self.provider, special_format=custom_format_func)
-            tools = self.tool_registry.export_for(self.provider, special_format=custom_format_func)
-            headers = {"Content-Type": "application/json"}
+            replaying = self._pending_turn is not None
+            if replaying:
+                # --- 0. RESUME: this turn was already asked and answered ---
+                # The provider told us which tools to run and some of them ran
+                # before a human was asked. Re-sending the request would cost a
+                # second call and could come back asking for something else
+                # entirely, stranding the work that already happened.
+                pending = self._pending_turn
+                self._pending_turn = None
+                self._replay_results = dict(pending.get("completed") or {})
+                response = pending["response"]
+            else:
+                history = self.conversation.export_for(self.provider, special_format=custom_format_func)
+                tools = self.tool_registry.export_for(self.provider, special_format=custom_format_func)
+                headers = {"Content-Type": "application/json"}
 
-            # --- 1. COMPILE THE TARGET PAYLOAD ---
-            payload = self.gen_payload(history, tools, headers, max_tokens)
+                # --- 1. COMPILE THE TARGET PAYLOAD ---
+                payload = self.gen_payload(history, tools, headers, max_tokens)
 
-            # --- 2. SEND THE REQUEST ---
-            self._update_stage("Request sent to AI", f"Payload Size: {len(history)} turns", thinking_visible=thinking_visible)
+                # --- 2. SEND THE REQUEST ---
+                self._update_stage("Request sent to AI", f"Payload Size: {len(history)} turns", thinking_visible=thinking_visible)
 
-            spinner_async_task = None
-            if spinner:
-                spinner_async_task = asyncio.create_task(self._animate_spinner(thinking_visible))
+                spinner_async_task = None
+                if spinner:
+                    spinner_async_task = asyncio.create_task(self._animate_spinner(thinking_visible))
 
-            response = None
-            try:
-                # Offloads urllib request to thread pool; returns result directly or raises exception
-                response = await asyncio.to_thread(self._send_request, payload, headers)
-            except Exception as err:
-                # Preserves explicit error logging before bubbling up
-                self._update_stage("Network/API Exception", str(err), thinking_visible=thinking_visible)
-                raise err
-            finally:
-                if spinner_async_task:
-                    spinner_async_task.cancel()
-                    try:
-                        await spinner_async_task
-                    except asyncio.CancelledError:
-                        pass
+                response = None
+                try:
+                    # Offloads urllib request to thread pool; returns result directly or raises exception
+                    response = await asyncio.to_thread(self._send_request, payload, headers)
+                except Exception as err:
+                    # Preserves explicit error logging before bubbling up
+                    self._update_stage("Network/API Exception", str(err), thinking_visible=thinking_visible)
+                    raise err
+                finally:
+                    if spinner_async_task:
+                        spinner_async_task.cancel()
+                        try:
+                            await spinner_async_task
+                        except asyncio.CancelledError:
+                            pass
 
             # --- 3. PROCESS COMPLETED RESPONSE OBJECTS ---
-            output = self.process_response(response, thinking_visible=thinking_visible)
+            # Where history stood before this turn wrote anything, so a pause
+            # can put it back. process_response appends the assistant message
+            # before dispatching the tools it asked for; leaving that message
+            # behind with no tool results after it is a shape every provider
+            # rejects, and it is also simply untrue - that turn did not happen.
+            history_mark = len(self.conversation.history)
+            self._partial_results = {}
+            try:
+                output = await self.process_response(response, thinking_visible=thinking_visible)
+            except RunPaused:
+                del self.conversation.history[history_mark:]
+                self._pending_turn = {"response": response, "completed": dict(self._partial_results)}
+                raise
+            finally:
+                self._replay_results = None
+                self._partial_results = {}
+
             if output is not None: 
                 return output
             continue # continue to the next iteration - left in case of changes later
 
 
 def test():
-    import dotenv
-    dotenv.load_dotenv()
+    # llmadapt's own .env loader, not the third-party `dotenv` package - which
+    # had no business being imported from a library whose first stated
+    # convention is zero third-party dependencies. Agent resolves the key
+    # itself now, so this call only makes the demo's behaviour explicit.
+    from .env import load_env
+    load_env()
     agent = Agent('gemini', 'gemini-3.5-flash')
     while True:
         user_input = input("You: ")

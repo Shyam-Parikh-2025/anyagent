@@ -107,6 +107,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <h2>Selected employee</h2>
     <div id="editor"><p class="hint">Select a node to edit it. Shift-click for several.</p></div>
 
+    <h2>Model routing</h2>
+    <div class="row">
+      <div>
+        <label>Default mode</label>
+        <select id="policyMode"></select>
+      </div>
+    </div>
+    <p class="hint">What every employee inherits unless their own panel says otherwise.
+      "local" keeps the whole company off paid APIs.</p>
+
     <h2>Review</h2>
     <div class="row">
       <div>
@@ -151,10 +161,11 @@ const NODE_W = 168, NODE_H = 52;
 
 const state = {
   options: { ranks: [], skills: [], personalities: [], palettes: [], org_templates: [],
-             sizes: [], review_modes: [], templates_detail: {} },
+             sizes: [], review_modes: [], policy_modes: [], effort_levels: [], templates_detail: {} },
   palettes: {},
   spec: { name: "New Company", template: null, size: "small", employees: [], palette: "dataviz",
-          total_token_budget: null, review_mode: "critique", max_review_rounds: 1, layout: {} },
+          total_token_budget: null, review_mode: "critique", max_review_rounds: 1,
+          default_policy_mode: null, layout: {} },
   selected: new Set(),
   connectFrom: null,
   connecting: false,
@@ -338,6 +349,7 @@ function renderEditor() {
 
   const skillBox = document.createElement("div");
   skillBox.className = "checks";
+  const descs = (state.options.descriptions || {});
   state.options.skills.forEach((skill) => {
     const l = document.createElement("label");
     const cb = document.createElement("input");
@@ -349,6 +361,10 @@ function renderEditor() {
       else emp.skills = emp.skills.filter((s) => s !== skill);
       render();
     };
+    // What the skill actually does, on hover - a checkbox list of bare names
+    // is not something anyone can pick from confidently.
+    const about = (descs.skills || {})[skill];
+    if (about) l.title = skill + " - " + about;
     l.appendChild(cb);
     l.appendChild(document.createTextNode(skill));
     skillBox.appendChild(l);
@@ -357,19 +373,31 @@ function renderEditor() {
 
   const persSel = document.createElement("select");
   persSel.innerHTML = '<option value="">(none)</option>' + state.options.personalities.map(
-    (p) => `<option${p === emp.personality ? " selected" : ""}>${p}</option>`).join("");
-  persSel.onchange = () => { emp.personality = persSel.value || null; };
-  field("Personality", persSel);
+    (p) => `<option${p === emp.personality ? " selected" : ""} title="${descs.personalities ? (descs.personalities[p] || "") : ""}">${p}</option>`).join("");
+  // A one-line "what this means" under the dropdown, updated as it changes -
+  // an <option> title is not shown by every browser, and the description is
+  // most wanted at the moment of choosing.
+  const persAbout = document.createElement("div");
+  persAbout.className = "hint";
+  const showPers = () => {
+    persAbout.textContent = (descs.personalities || {})[emp.personality] || "";
+  };
+  showPers();
+  persSel.onchange = () => { emp.personality = persSel.value || null; showPers(); };
+  const persWrap = document.createElement("div");
+  persWrap.appendChild(persSel);
+  persWrap.appendChild(persAbout);
+  field("Personality", persWrap);
 
   const effortSel = document.createElement("select");
-  effortSel.innerHTML = ["", "cheap", "balanced", "effort"].map(
+  effortSel.innerHTML = [""].concat(state.options.effort_levels).map(
     (e) => `<option value="${e}"${e === (emp.effort || "") ? " selected" : ""}>${e || "(rank default)"}</option>`
   ).join("");
   effortSel.onchange = () => { emp.effort = effortSel.value || null; };
   field("Effort hint", effortSel);
 
   const modeSel = document.createElement("select");
-  modeSel.innerHTML = ["", "auto", "local", "api"].map(
+  modeSel.innerHTML = [""].concat(state.options.policy_modes).map(
     (m) => `<option value="${m}"${m === (emp.mode || "") ? " selected" : ""}>${m || "(use model_map)"}</option>`
   ).join("");
   modeSel.onchange = () => { emp.mode = modeSel.value || null; };
@@ -671,6 +699,9 @@ function collect() {
   const budget = parseInt($("budget").value, 10);
   state.spec.total_token_budget = budget > 0 ? budget : null;
   state.spec.review_mode = $("reviewMode").value;
+  /* "" is the "(inherit / none)" option - it has to become null, not "", or the
+     spec would claim a mode it does not have and validate() would reject it. */
+  state.spec.default_policy_mode = $("policyMode").value || null;
   state.spec.max_review_rounds = parseInt($("reviewRounds").value, 10) || 0;
   state.spec.size = $("size").value;
   return state.spec;
@@ -731,14 +762,50 @@ $("check").onclick = () => {
 };
 
 $("download").onclick = () => {
-  api("/api/save", collect()).then((data) => {
+  const spec = collect();
+  api("/api/save", spec).then((data) => {
     if (data.problems && data.problems.length) {
       showProblems(data.problems, data.warnings || []);
       return status("Not saved - fix the problems first", "bad");
     }
-    status("Saved to " + (data.path || "the launching process"), "ok");
+    showProblems([], data.warnings || []);
+    // /api/save only writes a file when the Python process that opened this
+    // page passed save_path= to launch_gui()/set_company_up(mode="gui")/
+    // make_company_via_gui() - most callers don't, since it's meant for "the
+    // caller wants a specific file on disk", not "the button should do
+    // something." Without that fallback, this button used to report
+    // "Saved to the launching process" while writing nothing anywhere the
+    // user could find it - which reads as broken, because from the user's
+    // side, nothing happened. It now always triggers an actual browser
+    // download of the validated design, so the button does something
+    // real regardless of how Python launched it; the server-side write
+    // still happens too, and is reported alongside it, when save_path was set.
+    downloadJson(spec, safeFilename(spec.name) + ".json");
+    status(
+      data.path
+        ? "Downloaded, and also written to " + data.path + " by the launching process"
+        : "Downloaded to your browser's downloads folder",
+      "ok"
+    );
   });
 };
+
+function safeFilename(name) {
+  const cleaned = String(name || "company").trim().replace(/[^a-zA-Z0-9._-]+/g, "-");
+  return cleaned || "company";
+}
+
+function downloadJson(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
 
 $("build").onclick = () => {
   api("/api/build", collect()).then((data) => {
@@ -777,6 +844,9 @@ Promise.all([api("/api/options"), api("/api/spec")]).then(([options, spec]) => {
   fillSelect($("palette"), options.palettes, state.spec.palette);
   fillSelect($("size"), options.sizes, state.spec.size);
   fillSelect($("reviewMode"), options.review_modes, state.spec.review_mode);
+  $("policyMode").innerHTML = '<option value="">(none)</option>' +
+    options.policy_modes.map((m) => `<option>${m}</option>`).join("");
+  $("policyMode").value = state.spec.default_policy_mode || "";
   $("template").innerHTML = '<option value="">(none)</option>' +
     options.org_templates.map((t) => `<option>${t}</option>`).join("");
   $("template").onchange = () => {

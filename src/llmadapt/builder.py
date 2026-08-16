@@ -35,9 +35,19 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .company import Company, EscalationDecision, EscalationEvent
+from .company import (
+    POLICY_MODES,
+    REVIEW_MODES,
+    Company,
+    EscalationDecision,
+    EscalationEvent,
+    always_approve,
+    always_decline,
+    default_on_escalation,
+)
 from .core import ToolRegistry
-from .presets import ORG_TEMPLATES, PALETTES, PERSONALITIES, SKILLS, TASK_SIZES, default_bundle
+from .help import company_help
+from .presets import TASK_SIZES, default_bundle
 from .router import RoleRank
 
 # A rank -> model_map entry used when the caller supplies no model_map at all.
@@ -49,19 +59,12 @@ DEFAULT_MODEL_MAP: Dict[str, Dict[str, Any]] = {
     for rank in RoleRank.ORDER
 }
 
-
-def default_on_escalation(event: EscalationEvent) -> EscalationDecision:
-    """The escalation callback used when the caller supplies none.
-
-    Declines. That is the deliberate choice, matching the 0-means-always-ask
-    defaults Phases 0-3 set for both emergency reserves: a company built
-    programmatically (possibly by another AI) has no human attached to it, and
-    "no human available" must mean "stop", never "approve yourself".
-    """
-    return EscalationDecision(
-        approve=False,
-        note="No on_escalation handler was configured for this company, so the request was declined.",
-    )
+# default_on_escalation now lives in company/escalation.py, where Company
+# itself can fall back to it too - re-imported here (rather than redefined)
+# so this stays the one definition both paths share, and so
+# `from llmadapt.builder import default_on_escalation` keeps working exactly
+# as it did before. always_decline/always_approve are re-exported the same
+# way, for callers who reach for them via builder.py specifically.
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +127,13 @@ class CompanySpec:
     emergency_iteration_reserve: int = 0
     review_mode: str = "critique"
     max_review_rounds: int = 1
+    # "auto" | "local" | "api" | None. The routing mode every employee
+    # inherits unless their own spec or their rank's model_map entry names
+    # one. It *is* a spec field, unlike provider/model/api_key, because it
+    # names no vendor and carries no credential - "this design is meant to run
+    # on local models" is a property of the design, and the thing most worth
+    # not losing when a design file is shared or reopened.
+    default_policy_mode: Optional[str] = None
     notes: str = ""
     # GUI-only: where gui.py's node-graph editor put each node, keyed by
     # employee name. Carried in the spec so reopening a saved design doesn't
@@ -149,6 +159,7 @@ class CompanySpec:
             "emergency_budget_tokens": self.emergency_budget_tokens,
             "emergency_iteration_reserve": self.emergency_iteration_reserve,
             "review_mode": self.review_mode, "max_review_rounds": self.max_review_rounds,
+            "default_policy_mode": self.default_policy_mode,
             "notes": self.notes, "layout": {k: list(v) for k, v in (self.layout or {}).items()},
         }
 
@@ -181,8 +192,13 @@ class CompanySpec:
             problems.append(
                 f"unknown palette {self.palette!r}. Available: {', '.join(bundle.palettes.names())}"
             )
-        if self.review_mode not in ("critique", "append", "off"):
-            problems.append(f"review_mode {self.review_mode!r} is not one of: critique, append, off")
+        if self.review_mode not in REVIEW_MODES:
+            problems.append(f"review_mode {self.review_mode!r} is not one of: {', '.join(REVIEW_MODES)}")
+        if self.default_policy_mode is not None and self.default_policy_mode not in POLICY_MODES:
+            problems.append(
+                f"default_policy_mode {self.default_policy_mode!r} is not one of: "
+                f"{', '.join(POLICY_MODES)}"
+            )
         if not self.template and not self.employees:
             problems.append("give either a template or at least one employee")
 
@@ -330,8 +346,19 @@ def build_company(
             "no on_escalation handler given - escalations will be declined automatically"
         )
     if spec.total_token_budget is None:
+        # Deliberately loud, and deliberately not fatal. 0 (or omitted) keeping
+        # its "no ceiling" meaning is the right call for a flat scalar schema
+        # an AI fills in - a magic sentinel for "unlimited" is one more thing
+        # to get wrong, and validate() rejecting a plausible 0 turns an
+        # omission into a failed build. But an unbounded company is the single
+        # most expensive mistake available here, so it is reported rather than
+        # taken silently, the same rule every other default in this function
+        # follows. Nothing has been spent at this point either way: building
+        # runs nothing.
         warnings.append(
-            "no total_token_budget set - this company has no spend ceiling (see Phase 3)"
+            "NO SPEND CEILING: total_token_budget is unset (0 or omitted means unlimited), so "
+            "this company can spend without any hard stop. Set total_token_budget to a real "
+            "number of tokens to cap it - see Phase 3's budget gate."
         )
 
     company = Company(
@@ -344,6 +371,7 @@ def build_company(
         model_policy=model_policy,
         presets=presets,
         log_compaction=log_compaction,
+        default_policy_mode=spec.default_policy_mode,
     )
 
     if spec.template:
@@ -400,8 +428,36 @@ def company_options(bundle: Optional[Any] = None) -> Dict[str, List[str]]:
     options = bundle.names()
     options["ranks"] = list(RoleRank.ORDER)
     options["sizes"] = list(TASK_SIZES)
-    options["review_modes"] = ["critique", "append", "off"]
+    options["review_modes"] = list(REVIEW_MODES)
+    options["policy_modes"] = list(POLICY_MODES)
+    # What each of those names actually does. Added as a separate key rather
+    # than by turning the lists into objects, so every existing reader that
+    # expects `options["skills"]` to be a list of strings keeps working.
+    options["descriptions"] = preset_descriptions(bundle)
     return options
+
+def preset_descriptions(bundle: Optional[Any] = None) -> Dict[str, Dict[str, str]]:
+    """name -> one-line description, for every preset a caller may name.
+
+    `company_options()` answers "what may I write here?"; this answers "what
+    would that one do?". They were the same call for a while, which meant both
+    the GUI and the schema handed people a list of bare names like
+    `prompt-engineering` and `discovery-pod` and left them to guess - a
+    checkbox list nobody can choose from confidently is not really a choice.
+
+    Kept as a flat name -> string map rather than the full preset objects,
+    because the callers are a tooltip and a tool-schema line, and neither wants
+    a skill's constraint list or a palette's fourteen hex codes.
+    """
+    bundle = bundle or default_bundle()
+    out: Dict[str, Dict[str, str]] = {}
+    for kind, registry in (("skills", bundle.skills),
+                           ("personalities", bundle.personalities),
+                           ("palettes", bundle.palettes),
+                           ("org_templates", bundle.org_templates)):
+        out[kind] = {p.name: (p.description or "").strip() for p in registry.all()}
+    return out
+
 
 
 def set_up_company(
@@ -414,12 +470,17 @@ def set_up_company(
     max_review_rounds: int = 1,
     employees_json: str = "",
     notes: str = "",
+    help_only: bool = False,
 ) -> str:
     """Create a multi-agent company and report what was built.
 
     Builds the org only - it does not run any task, so calling this costs
-    nothing. Call company_options() first to see the valid names for template,
-    skills, personalities and palettes.
+    nothing.
+
+    If you are not sure what to pass, call this with help_only=true first: it
+    builds nothing and returns a full rundown - what a company is, every valid
+    template/skill/personality/palette name WITH a description of what each one
+    does, the safety defaults, and worked examples.
 
     name: what to call the company.
     template: a ready-made org shape by name, e.g. 'small-coding-team'. Leave
@@ -428,7 +489,9 @@ def set_up_company(
         worker roles. Ignored when no template is given.
     palette: the org-chart colour scheme by name, e.g. 'dataviz'.
     total_token_budget: a hard ceiling on total tokens this company may spend.
-        0 means no ceiling, which is the riskier choice.
+        0 means NO ceiling - the company can spend without any hard stop.
+        Prefer a real number unless the user has said they want it unlimited;
+        a warning is returned when it is left at 0.
     review_mode: 'critique' (reviewer can send work back), 'append' (reviewer
         gives a second opinion) or 'off' (no review).
     max_review_rounds: how many times a reviewer may send work back.
@@ -439,9 +502,16 @@ def set_up_company(
         template to extend it.
     notes: free text stored with the spec, for whoever reads it later.
 
+    help_only: set true to build nothing and get the full rundown instead -
+        concepts, every valid name with its description, safety defaults and
+        examples. Every other argument is ignored when this is set. Start here
+        if anything below is unclear.
+
     Returns a JSON report: whether it worked, the employees and teams created,
     an ASCII org chart, and any problems or warnings.
     """
+    if help_only:
+        return json.dumps(set_company_up(mode="help"), indent=2, default=str)
     result = set_company_up(
         mode="text", name=name, template=template, size=size, palette=palette,
         total_token_budget=total_token_budget, review_mode=review_mode,
@@ -514,6 +584,11 @@ def set_company_up(mode: str = "text", **kwargs: Any) -> Any:
         wrapped as a tool returning JSON.
     mode="gui" - open the interactive node-graph editor (see gui.py) and
         return whatever the user built there.
+    mode="help" - build nothing and return a full rundown instead: the
+        concepts, every valid name with a description of what it does, the
+        safety defaults, how to run work afterwards, and worked examples.
+        Pass as_text=True for markdown instead of a dict. This is the "I have
+        no idea what to pass" entry point, for a model and a person alike.
 
     Text-mode arguments are the fields of CompanySpec, plus the runtime
     arguments of build_company (model_map, on_escalation, model_policy,
@@ -525,8 +600,17 @@ def set_company_up(mode: str = "text", **kwargs: Any) -> Any:
         from .gui import launch_gui
 
         return launch_gui(**kwargs)
+    if mode == "help":
+        # Everything a caller needs to know before using either of the other
+        # two modes: the concepts, every option with a description of what it
+        # does, the safety defaults written out rather than implied, and
+        # worked examples. Builds nothing.
+        from .help import company_help
+
+        return company_help(bundle=kwargs.get("presets"),
+                            as_text=bool(kwargs.get("as_text", False)))
     if mode != "text":
-        raise ValueError(f"unknown mode {mode!r} - use 'text' or 'gui'")
+        raise ValueError(f"unknown mode {mode!r} - use 'text', 'gui' or 'help'")
 
     runtime_keys = ("model_map", "on_escalation", "model_policy", "presets", "log_compaction")
     runtime = {k: kwargs.pop(k) for k in runtime_keys if k in kwargs}
@@ -560,9 +644,79 @@ def set_company_up(mode: str = "text", **kwargs: Any) -> Any:
     return build_company(spec, **runtime)
 
 
+def make_company_via_gui(**kwargs: Any) -> BuildResult:
+    """Open the node-graph company editor and hand back a BuildResult once
+    the user clicks Build - the same thing `set_company_up(mode="gui", ...)`
+    already does, under a name that says what it does rather than how it's
+    configured.
+
+        result = make_company_via_gui(model_map=my_model_map, on_escalation=my_handler)
+        company = result.company   # a live Company, ready to use in code
+
+    Every keyword `set_company_up(mode="gui", ...)` accepts works here too:
+    the runtime arguments (model_map / on_escalation / model_policy / presets
+    / log_compaction) forwarded to build_company() once the design is built,
+    plus launch_gui's own port / save_path / open_browser / block / timeout.
+    Building runs nothing either way - see gui.py and set_company_up for the
+    full scope notes.
+    """
+    return set_company_up(mode="gui", **kwargs)
+
+
+def quick_company(
+    template: str,
+    name: str = "New Company",
+    size: str = "small",
+    model_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    on_escalation: Optional[Callable[[EscalationEvent], EscalationDecision]] = None,
+    total_token_budget: Optional[int] = None,
+    **template_kwargs: Any,
+) -> Company:
+    """The one-call path: a template name in, a ready-to-run Company out.
+
+        company = quick_company("small-coding-team")
+        print(company.run("Write a CSV parser"))
+
+    This is sugar over `Company(...)` + `Company.build_from_template(...)` for
+    the common case - reach for those two directly the moment you need more
+    than "one template, one call" (a hand-mixed org, several templates in one
+    company, per-employee overrides). Nothing here loosens what those two
+    already default to safely:
+
+      - model_map=None still means every rank defaults to local Ollama (see
+        DEFAULT_MODEL_MAP) - an unconfigured company cannot spend money.
+      - on_escalation=None still means decline (Company falls back to
+        escalation.default_on_escalation itself) - no human in the loop
+        means "stop", not "approve yourself". Pass
+        escalation.always_approve(...) explicitly if you want a local
+        prototype to self-approve.
+      - total_token_budget=None still means unlimited - set a real number
+        once you're past the toy-example stage.
+
+    **template_kwargs is forwarded to build_from_template() (review_mode,
+    max_review_rounds, name_prefix, and any hire() override such as
+    mode="auto" to route the whole template through a ModelPolicy).
+
+    Returns the Company, with the new Team already built and registered
+    (`company.teams[-1]`) - `company.run(...)` picks the highest-ranked
+    employee as the default entry point, which for a single-template company
+    is that team's own lead.
+    """
+    company = Company(
+        name=name,
+        model_map=model_map or DEFAULT_MODEL_MAP,
+        on_escalation=on_escalation,
+        total_token_budget=total_token_budget,
+    )
+    company.build_from_template(template, size=size, **template_kwargs)
+    return company
+
+
 __all__ = [
     "CompanySpec", "EmployeeSpec", "BuildResult",
-    "build_company", "set_company_up", "set_up_company",
-    "company_setup_schema", "company_options", "register_company_builder",
-    "default_on_escalation", "DEFAULT_MODEL_MAP",
+    "build_company", "set_company_up", "set_up_company", "make_company_via_gui",
+    "quick_company",
+    "company_setup_schema", "company_options", "preset_descriptions",
+    "company_help", "register_company_builder",
+    "default_on_escalation", "always_decline", "always_approve", "DEFAULT_MODEL_MAP",
 ]

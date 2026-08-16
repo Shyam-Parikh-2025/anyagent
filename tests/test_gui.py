@@ -21,6 +21,7 @@ import urllib.request
 from llmadapt.builder import CompanySpec
 from llmadapt.gui import CompanyBuilderServer, _template_employees, launch_gui
 from llmadapt.gui_assets import HTML_PAGE
+from llmadapt.policy import EFFORT_LEVELS
 from llmadapt.presets import ORG_TEMPLATES, TASK_SIZES, default_bundle
 from llmadapt.router import RoleRank
 
@@ -105,6 +106,7 @@ assert options["org_templates"] == ORG_TEMPLATES.names()
 assert options["ranks"] == list(RoleRank.ORDER)
 assert options["sizes"] == list(TASK_SIZES)
 assert options["review_modes"] == ["critique", "append", "off"]
+assert options["effort_levels"] == list(EFFORT_LEVELS)
 assert "dataviz" in options["palette_colors"]
 assert len(options["palette_colors"]["dataviz"]["ranks_light"]) == len(RoleRank.ORDER)
 assert options["templates_detail"]["solo"]["description"]
@@ -255,6 +257,22 @@ for name in ("GENERAL_MANAGER", "VOLUNTEER", "small-coding-team", "research-pod"
     assert name not in script, f"{name} should be fetched from /api/options, not hardcoded"
 assert "/api/options" in script and "state.options.ranks" in script
 print("PASS 26: the page fetches ranks, skills, templates and palettes rather than hardcoding them")
+
+# The per-employee effort/policy-mode dropdowns used to hardcode their own
+# copy of the option list instead of reading state.options like every other
+# control on the page - the exact duplication PASS 26 already guards against
+# for ranks/skills/templates/palettes, just missed for these two fields.
+for literal in ('["", "cheap", "balanced", "effort"]', '["", "auto", "local", "api"]'):
+    assert literal not in script, f"{literal!r} should be fetched from /api/options, not hardcoded"
+assert "state.options.effort_levels" in script and "state.options.policy_modes" in script
+print("PASS 26b: the per-employee effort/policy-mode dropdowns read from state.options too")
+
+# Save JSON must not silently no-op when the launching process didn't
+# configure a save_path - the page always offers a real browser download,
+# and only mentions a server-side path when one actually exists.
+assert "function downloadJson" in script and "URL.createObjectURL" in script
+assert "downloadJson(spec" in script
+print("PASS 26c: Save JSON always triggers a real browser download, not just a server call")
 
 # Every endpoint the page calls must exist on the server, and vice versa.
 called = set(re.findall(r'api\("(/api/[a-z]+)"', script))

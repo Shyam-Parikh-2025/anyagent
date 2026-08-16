@@ -3,7 +3,11 @@
 # in for each Agent's HTTP layer (same pattern test_agent.py already uses).
 import json
 
-from llmadapt.company import Company, EscalationDecision, EscalationUnresolved
+from llmadapt.company import (
+    Company, EscalationDecision, EscalationUnresolved,
+    always_approve, always_decline, default_on_escalation,
+)
+from llmadapt.company.escalation import EscalationEvent
 from llmadapt.router import RoleRank
 
 
@@ -212,5 +216,84 @@ assert [e["kind"] for e in company.activity().by_employee("Manager1")] == ["hire
 assert len(company.activity().by_kind("task_start")) == 1
 assert len(company.tool_calls()) == 0, "no delegation happened in this run, so tool_call_log should be empty"
 print("PASS: activity_log records the lifecycle, and activity()/tool_calls() query it as EventLogs")
+
+# Test 10: Company() with no on_escalation at all falls back to
+# default_on_escalation (declines) instead of requiring every caller to pass
+# a callback - the same safe default build_company()/set_company_up() already
+# applied when none was given.
+bare = Company(name="Bare Co", model_map=MODEL_MAP)
+assert bare.on_escalation is default_on_escalation
+decision = bare.on_escalation(
+    EscalationEvent(kind="budget_exhausted", employee_name="X", rank=RoleRank.JUNIOR, message="m"))
+assert decision.approve is False
+assert always_decline is default_on_escalation
+print("PASS: Company(on_escalation=None) falls back to default_on_escalation, which declines")
+
+# Test 11: always_approve() builds a handler that approves everything with
+# the fixed grants it was configured with, regardless of event kind.
+handler = always_approve(extra_token_budget=750, extra_tool_iterations=4)
+for kind in ("tool_iteration_limit", "budget_exhausted"):
+    d = handler(EscalationEvent(kind=kind, employee_name="Y", rank=RoleRank.JUNIOR, message="m"))
+    assert d.approve is True
+    assert d.extra_token_budget == 750
+    assert d.extra_tool_iterations == 4
+print("PASS: always_approve(...) approves every escalation with the configured grants")
+
+# Test 11b: a bare Company wired to always_approve() actually recovers a
+# runaway employee end-to-end, the same way Test 7's hand-written approver did.
+company = make_company(emergency_iteration_reserve=0, on_escalation=always_approve(extra_tool_iterations=5))
+manager = company.hire("Manager1", RoleRank.MANAGER)
+junior = company.hire("Junior1", RoleRank.JUNIOR, reports_to=manager)
+junior.agent.set_max_tool_iterations(1)
+junior.agent._send_request = FakeResponder([
+    tool_call_response("some_unregistered_tool", {}), text_response("done via always_approve"),
+])
+result = junior.run("task", company=company)
+assert result == "done via always_approve"
+print("PASS: always_approve() wired into a real Company recovers a runaway employee end-to-end")
+
+
+# Test 12: a declined escalation raised inside a *delegated* employee reaches
+# the caller instead of being handed to the delegating manager's model.
+#
+# Regression test. `delegate_to_<name>` is an ordinary tool, so
+# EscalationUnresolved used to be caught by ToolRegistry.execute()'s catch-all
+# and turned into a "Tool Execution Failure (EscalationUnresolved)" string. The
+# manager read that as a tool that didn't work, carried on, and Company.run()
+# returned a normal answer - so a human declining stopped nothing unless the
+# escalation happened at the entry point itself. EscalationUnresolved now
+# subclasses core.ToolControlFlow, which execute() re-raises.
+company = make_company(on_escalation=lambda event: EscalationDecision(approve=False))
+boss = company.hire("Boss", RoleRank.C_SUITE)
+junior = company.hire("Junior", RoleRank.JUNIOR, reports_to=boss)
+junior.agent.set_max_tool_iterations(1)
+junior.agent._send_request = FakeResponder([
+    tool_call_response("some_unregistered_tool", {}),
+    tool_call_response("some_unregistered_tool", {}),
+])
+boss.agent._send_request = FakeResponder([
+    # NB the registered tool name is lower-cased (Employee.delegate_tool), while
+    # tool_call_log records it as delegate_to_<Employee.name> - see the assertion below.
+    tool_call_response("delegate_to_junior", {"task": "do it"}),
+    text_response("the manager should never get to answer"),
+])
+try:
+    company.run("top task", entry_point=boss)
+    assert False, "a declined escalation from a delegate must not be swallowed into a tool result"
+except EscalationUnresolved as e:
+    assert e.event.employee_name == "Junior"
+    assert e.event.kind == "tool_iteration_limit"
+print("PASS: a declined escalation inside a delegate propagates instead of becoming a tool result")
+
+# ...and the delegation is still recorded on the way out, so the audit trail
+# does not lose the call just because it raised.
+delegations = [e for e in company.tool_call_log if e["tool_name"] == "delegate_to_Junior"]
+assert len(delegations) == 1 and delegations[0]["error"], delegations
+assert "Unresolved escalation from Junior" in delegations[0]["error"]
+print("PASS: the failed delegation is still recorded in tool_call_log with its error")
+
+# The manager never got a second turn - it was still waiting on the tool.
+assert not any(m.get("role") == "tool" for m in boss.agent.conversation.history)
+print("PASS: the manager's model was never handed a tool result for the declined delegation")
 
 print("\nAll checks passed.")

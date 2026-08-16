@@ -45,7 +45,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
 from .builder import BuildResult, CompanySpec, build_company
+from .company import POLICY_MODES, REVIEW_MODES
 from .gui_assets import HTML_PAGE
+from .policy import EFFORT_LEVELS
 from .presets import TASK_SIZES, default_bundle
 from .router import RoleRank
 
@@ -61,7 +63,14 @@ def _options_payload(bundle: Any) -> Dict[str, Any]:
     options: Dict[str, Any] = bundle.names()
     options["ranks"] = list(RoleRank.ORDER)
     options["sizes"] = list(TASK_SIZES)
-    options["review_modes"] = ["critique", "append", "off"]
+    options["review_modes"] = list(REVIEW_MODES)
+    options["policy_modes"] = list(POLICY_MODES)
+    options["effort_levels"] = list(EFFORT_LEVELS)
+    # So the editor can say what a skill or personality is for, instead of
+    # showing a checkbox list of bare names and hoping they are self-evident.
+    from .builder import preset_descriptions
+
+    options["descriptions"] = preset_descriptions(bundle)
     options["templates_detail"] = {
         name: {"description": bundle.org_templates.get(name).description}
         for name in bundle.org_templates.names()
